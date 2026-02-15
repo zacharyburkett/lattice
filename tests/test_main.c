@@ -586,6 +586,127 @@ static int test_query_validation_conflicts(void)
     return 0;
 }
 
+static int test_deferred_component_visibility_and_payload_copy(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t entity;
+    test_vec3_t position;
+    test_vec3_t* out_position;
+    lt_world_stats_t stats;
+    uint8_t has;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+    ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+    position.x = 3.0f;
+    position.y = 4.0f;
+    position.z = 5.0f;
+
+    ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+
+    position.x = 99.0f;
+    position.y = 100.0f;
+    position.z = 101.0f;
+
+    ASSERT_STATUS(lt_has_component(world, entity, position_id, &has), LT_STATUS_OK);
+    ASSERT_TRUE(has == 0u);
+
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.pending_commands == 1u);
+    ASSERT_TRUE(stats.defer_depth == 1u);
+
+    ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_has_component(world, entity, position_id, &has), LT_STATUS_OK);
+    ASSERT_TRUE(has == 1u);
+
+    out_position = NULL;
+    ASSERT_STATUS(lt_get_component(world, entity, position_id, (void**)&out_position), LT_STATUS_OK);
+    ASSERT_TRUE(out_position->x == 3.0f);
+    ASSERT_TRUE(out_position->y == 4.0f);
+    ASSERT_TRUE(out_position->z == 5.0f);
+
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.pending_commands == 0u);
+    ASSERT_TRUE(stats.defer_depth == 0u);
+
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int test_deferred_flush_conflict_and_destroy(void)
+{
+    lt_world_t* world;
+    lt_entity_t entity;
+    uint8_t alive;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_destroy(world, entity), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_CONFLICT);
+    ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_CONFLICT);
+    ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_entity_is_alive(world, entity, &alive), LT_STATUS_OK);
+    ASSERT_TRUE(alive == 0u);
+
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int test_deferred_command_ordering(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t entity;
+    test_vec3_t p0;
+    test_vec3_t p1;
+    test_vec3_t* out_position;
+    uint8_t has;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+    ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+    p0.x = 1.0f;
+    p0.y = 1.0f;
+    p0.z = 1.0f;
+    p1.x = 2.0f;
+    p1.y = 2.0f;
+    p1.z = 2.0f;
+
+    ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, entity, position_id, &p0), LT_STATUS_OK);
+    ASSERT_STATUS(lt_remove_component(world, entity, position_id), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, entity, position_id, &p1), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_has_component(world, entity, position_id, &has), LT_STATUS_OK);
+    ASSERT_TRUE(has == 1u);
+
+    out_position = NULL;
+    ASSERT_STATUS(lt_get_component(world, entity, position_id, (void**)&out_position), LT_STATUS_OK);
+    ASSERT_TRUE(out_position->x == 2.0f);
+    ASSERT_TRUE(out_position->y == 2.0f);
+    ASSERT_TRUE(out_position->z == 2.0f);
+
+    lt_world_destroy(world);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_destroy_defaults);
@@ -600,5 +721,8 @@ int main(void)
     RUN_TEST(test_tag_component_behavior);
     RUN_TEST(test_query_iteration_and_filters);
     RUN_TEST(test_query_validation_conflicts);
+    RUN_TEST(test_deferred_component_visibility_and_payload_copy);
+    RUN_TEST(test_deferred_flush_conflict_and_destroy);
+    RUN_TEST(test_deferred_command_ordering);
     return 0;
 }

@@ -58,6 +58,8 @@ typedef struct lt_world_stats_s {
     uint32_t registered_components;
     uint32_t archetype_count;
     uint32_t chunk_count;
+    uint32_t pending_commands;
+    uint32_t defer_depth;
 } lt_world_stats_t;
 
 typedef enum lt_access_e {
@@ -97,6 +99,9 @@ void lt_world_destroy(lt_world_t* world);
 
 lt_status_t lt_world_reserve_entities(lt_world_t* world, uint32_t entity_capacity);
 lt_status_t lt_world_reserve_components(lt_world_t* world, uint32_t component_capacity);
+lt_status_t lt_world_begin_defer(lt_world_t* world);
+lt_status_t lt_world_end_defer(lt_world_t* world);
+lt_status_t lt_world_flush(lt_world_t* world);
 
 lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity);
 lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity);
