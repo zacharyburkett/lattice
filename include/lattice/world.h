@@ -1,0 +1,80 @@
+#ifndef LATTICE_WORLD_H
+#define LATTICE_WORLD_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "lattice/types.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct lt_world_s lt_world_t;
+
+typedef void* (*lt_alloc_fn)(void* user, size_t size, size_t align);
+typedef void (*lt_free_fn)(void* user, void* ptr, size_t size, size_t align);
+
+typedef struct lt_allocator_s {
+    lt_alloc_fn alloc;
+    lt_free_fn free;
+    void* user;
+} lt_allocator_t;
+
+enum {
+    LT_COMPONENT_FLAG_NONE = 0u,
+    LT_COMPONENT_FLAG_TAG = 1u << 0,
+    LT_COMPONENT_FLAG_TRIVIALLY_RELOCATABLE = 1u << 1
+};
+
+typedef void (*lt_component_ctor_fn)(void* dst, uint32_t count, void* user);
+typedef void (*lt_component_dtor_fn)(void* dst, uint32_t count, void* user);
+typedef void (*lt_component_move_fn)(void* dst, const void* src, uint32_t count, void* user);
+
+typedef struct lt_component_desc_s {
+    const char* name;
+    uint32_t size;
+    uint32_t align;
+    uint32_t flags;
+    lt_component_ctor_fn ctor;
+    lt_component_dtor_fn dtor;
+    lt_component_move_fn move;
+    void* user;
+} lt_component_desc_t;
+
+typedef struct lt_world_config_s {
+    lt_allocator_t allocator;
+    uint32_t initial_entity_capacity;
+    uint32_t initial_component_capacity;
+} lt_world_config_t;
+
+typedef struct lt_world_stats_s {
+    uint32_t live_entities;
+    uint32_t entity_capacity;
+    uint32_t allocated_entity_slots;
+    uint32_t free_entity_slots;
+    uint32_t registered_components;
+} lt_world_stats_t;
+
+lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world);
+void lt_world_destroy(lt_world_t* world);
+
+lt_status_t lt_world_reserve_entities(lt_world_t* world, uint32_t entity_capacity);
+lt_status_t lt_world_reserve_components(lt_world_t* world, uint32_t component_capacity);
+
+lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity);
+lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity);
+lt_status_t lt_entity_is_alive(const lt_world_t* world, lt_entity_t entity, uint8_t* out_alive);
+
+lt_status_t lt_register_component(
+    lt_world_t* world,
+    const lt_component_desc_t* desc,
+    lt_component_id_t* out_id);
+
+lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_stats);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
