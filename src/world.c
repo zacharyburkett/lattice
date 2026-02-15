@@ -8,10 +8,21 @@
 #error "C11 or newer is required"
 #endif
 
+enum {
+    LT_DEFAULT_CHUNK_BYTES = 16u * 1024u,
+    LT_MAX_ROWS_PER_CHUNK = 4096u
+};
+
+typedef struct lt_archetype_s lt_archetype_t;
+typedef struct lt_chunk_s lt_chunk_t;
+
 typedef struct lt_entity_slot_s {
     uint32_t generation;
     uint32_t next_free;
     uint8_t alive;
+    lt_archetype_t* archetype;
+    lt_chunk_t* chunk;
+    uint32_t row;
 } lt_entity_slot_t;
 
 typedef struct lt_component_record_s {
@@ -25,8 +36,26 @@ typedef struct lt_component_record_s {
     void* user;
 } lt_component_record_t;
 
+struct lt_chunk_s {
+    lt_chunk_t* next;
+    uint32_t count;
+    uint32_t capacity;
+    lt_entity_t* entities;
+    uint8_t** columns;
+};
+
+struct lt_archetype_s {
+    lt_component_id_t* component_ids;
+    uint32_t component_count;
+    uint32_t rows_per_chunk;
+    lt_chunk_t* chunks;
+    lt_chunk_t* chunk_tail;
+    uint32_t chunk_count;
+};
+
 struct lt_world_s {
     lt_allocator_t allocator;
+    uint32_t target_chunk_bytes;
 
     lt_entity_slot_t* entities;
     uint32_t entity_capacity;
@@ -38,6 +67,12 @@ struct lt_world_s {
     lt_component_record_t* components;
     uint32_t component_capacity;
     uint32_t component_count;
+
+    lt_archetype_t** archetypes;
+    uint32_t archetype_capacity;
+    uint32_t archetype_count;
+    uint32_t total_chunk_count;
+    lt_archetype_t* root_archetype;
 };
 
 static int lt_is_power_of_two_u32(uint32_t v)
@@ -257,6 +292,60 @@ static lt_status_t lt_grow_components(lt_world_t* world, uint32_t min_capacity)
     return LT_STATUS_OK;
 }
 
+static lt_status_t lt_grow_archetypes(lt_world_t* world, uint32_t min_capacity)
+{
+    uint32_t old_capacity;
+    uint32_t new_capacity;
+    size_t old_size;
+    size_t new_size;
+    lt_archetype_t** new_archetypes;
+
+    if (world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (world->archetype_capacity >= min_capacity) {
+        return LT_STATUS_OK;
+    }
+
+    old_capacity = world->archetype_capacity;
+    new_capacity = old_capacity == 0u ? 8u : old_capacity;
+    while (new_capacity < min_capacity) {
+        if (new_capacity > UINT32_MAX / 2u) {
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+        new_capacity *= 2u;
+    }
+
+    if (sizeof(*new_archetypes) > SIZE_MAX / new_capacity) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    new_size = sizeof(*new_archetypes) * (size_t)new_capacity;
+    new_archetypes = (lt_archetype_t**)lt_alloc_bytes(
+        &world->allocator,
+        new_size,
+        _Alignof(lt_archetype_t*));
+    if (new_archetypes == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(new_archetypes, 0, new_size);
+
+    if (world->archetypes != NULL && old_capacity > 0u) {
+        old_size = sizeof(*new_archetypes) * (size_t)old_capacity;
+        memcpy(new_archetypes, world->archetypes, old_size);
+        lt_free_bytes(
+            &world->allocator,
+            world->archetypes,
+            old_size,
+            _Alignof(lt_archetype_t*));
+    }
+
+    world->archetypes = new_archetypes;
+    world->archetype_capacity = new_capacity;
+    return LT_STATUS_OK;
+}
+
 static int lt_component_names_equal(const char* a, const char* b)
 {
     if (a == NULL || b == NULL) {
@@ -316,6 +405,683 @@ static lt_status_t lt_component_name_copy(
     return LT_STATUS_OK;
 }
 
+static uint32_t lt_compute_rows_per_chunk(
+    const lt_world_t* world,
+    const lt_component_id_t* component_ids,
+    uint32_t component_count)
+{
+    size_t per_row_bytes;
+    uint32_t i;
+    uint32_t rows;
+
+    per_row_bytes = sizeof(lt_entity_t);
+    for (i = 0u; i < component_count; ++i) {
+        const lt_component_record_t* component;
+        lt_component_id_t component_id;
+
+        component_id = component_ids[i];
+        component = &world->components[component_id];
+        if (component->size > SIZE_MAX - per_row_bytes) {
+            return 1u;
+        }
+        per_row_bytes += component->size;
+    }
+
+    if (per_row_bytes == 0u) {
+        return 1u;
+    }
+
+    rows = (uint32_t)((size_t)world->target_chunk_bytes / per_row_bytes);
+    if (rows == 0u) {
+        rows = 1u;
+    }
+    if (rows > LT_MAX_ROWS_PER_CHUNK) {
+        rows = LT_MAX_ROWS_PER_CHUNK;
+    }
+    return rows;
+}
+
+static int lt_component_id_set_equal(
+    const lt_component_id_t* a,
+    uint32_t a_count,
+    const lt_component_id_t* b,
+    uint32_t b_count)
+{
+    if (a_count != b_count) {
+        return 0;
+    }
+    if (a_count == 0u) {
+        return 1;
+    }
+    return memcmp(a, b, sizeof(*a) * (size_t)a_count) == 0;
+}
+
+static lt_archetype_t* lt_find_archetype(
+    const lt_world_t* world,
+    const lt_component_id_t* component_ids,
+    uint32_t component_count)
+{
+    uint32_t i;
+
+    for (i = 0u; i < world->archetype_count; ++i) {
+        lt_archetype_t* archetype;
+
+        archetype = world->archetypes[i];
+        if (archetype != NULL
+            && lt_component_id_set_equal(
+                archetype->component_ids,
+                archetype->component_count,
+                component_ids,
+                component_count)) {
+            return archetype;
+        }
+    }
+
+    return NULL;
+}
+
+static lt_status_t lt_archetype_create(
+    lt_world_t* world,
+    const lt_component_id_t* component_ids,
+    uint32_t component_count,
+    lt_archetype_t** out_archetype)
+{
+    lt_archetype_t* archetype;
+    lt_status_t status;
+
+    if (world == NULL || out_archetype == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_archetype = NULL;
+
+    if (world->archetype_count == UINT32_MAX) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    status = lt_grow_archetypes(world, world->archetype_count + 1u);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    archetype = (lt_archetype_t*)lt_alloc_bytes(
+        &world->allocator,
+        sizeof(*archetype),
+        _Alignof(lt_archetype_t));
+    if (archetype == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(archetype, 0, sizeof(*archetype));
+
+    if (component_count > 0u) {
+        size_t ids_size;
+
+        if (sizeof(*component_ids) > SIZE_MAX / component_count) {
+            lt_free_bytes(&world->allocator, archetype, sizeof(*archetype), _Alignof(lt_archetype_t));
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+
+        ids_size = sizeof(*component_ids) * (size_t)component_count;
+        archetype->component_ids = (lt_component_id_t*)lt_alloc_bytes(
+            &world->allocator,
+            ids_size,
+            _Alignof(lt_component_id_t));
+        if (archetype->component_ids == NULL) {
+            lt_free_bytes(&world->allocator, archetype, sizeof(*archetype), _Alignof(lt_archetype_t));
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+        memcpy(archetype->component_ids, component_ids, ids_size);
+    }
+
+    archetype->component_count = component_count;
+    archetype->rows_per_chunk = lt_compute_rows_per_chunk(world, component_ids, component_count);
+    if (archetype->rows_per_chunk == 0u) {
+        archetype->rows_per_chunk = 1u;
+    }
+
+    world->archetypes[world->archetype_count] = archetype;
+    world->archetype_count += 1u;
+
+    *out_archetype = archetype;
+    return LT_STATUS_OK;
+}
+
+static lt_status_t lt_find_or_create_archetype(
+    lt_world_t* world,
+    const lt_component_id_t* component_ids,
+    uint32_t component_count,
+    lt_archetype_t** out_archetype)
+{
+    lt_archetype_t* archetype;
+
+    if (world == NULL || out_archetype == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    archetype = lt_find_archetype(world, component_ids, component_count);
+    if (archetype != NULL) {
+        *out_archetype = archetype;
+        return LT_STATUS_OK;
+    }
+
+    return lt_archetype_create(world, component_ids, component_count, out_archetype);
+}
+
+static int lt_archetype_find_component_index(
+    const lt_archetype_t* archetype,
+    lt_component_id_t component_id,
+    uint32_t* out_index)
+{
+    uint32_t i;
+
+    if (archetype == NULL || component_id == LT_COMPONENT_INVALID) {
+        return 0;
+    }
+
+    for (i = 0u; i < archetype->component_count; ++i) {
+        if (archetype->component_ids[i] == component_id) {
+            if (out_index != NULL) {
+                *out_index = i;
+            }
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void* lt_chunk_component_ptr(
+    const lt_world_t* world,
+    const lt_archetype_t* archetype,
+    lt_chunk_t* chunk,
+    uint32_t row,
+    uint32_t component_index)
+{
+    lt_component_id_t component_id;
+    const lt_component_record_t* component;
+
+    component_id = archetype->component_ids[component_index];
+    component = &world->components[component_id];
+
+    if (component->size == 0u) {
+        return NULL;
+    }
+
+    return (void*)(chunk->columns[component_index] + (size_t)component->size * (size_t)row);
+}
+
+static void lt_component_transfer(
+    const lt_component_record_t* component,
+    void* dst,
+    const void* src)
+{
+    if (component == NULL || component->size == 0u || dst == NULL || src == NULL || dst == src) {
+        return;
+    }
+
+    if (component->move != NULL) {
+        component->move(dst, src, 1u, component->user);
+    } else {
+        memcpy(dst, src, component->size);
+    }
+}
+
+static void lt_component_init_added(
+    const lt_component_record_t* component,
+    void* dst,
+    const void* initial_value)
+{
+    if (component == NULL || component->size == 0u || dst == NULL) {
+        return;
+    }
+
+    if (initial_value != NULL) {
+        memcpy(dst, initial_value, component->size);
+    } else if (component->ctor != NULL) {
+        component->ctor(dst, 1u, component->user);
+    } else {
+        memset(dst, 0, component->size);
+    }
+}
+
+static void lt_component_destruct_one(
+    const lt_component_record_t* component,
+    void* dst)
+{
+    if (component == NULL || component->size == 0u || dst == NULL || component->dtor == NULL) {
+        return;
+    }
+
+    component->dtor(dst, 1u, component->user);
+}
+
+static lt_status_t lt_chunk_create(
+    lt_world_t* world,
+    lt_archetype_t* archetype,
+    lt_chunk_t** out_chunk)
+{
+    lt_chunk_t* chunk;
+    uint32_t i;
+
+    if (world == NULL || archetype == NULL || out_chunk == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_chunk = NULL;
+
+    chunk = (lt_chunk_t*)lt_alloc_bytes(&world->allocator, sizeof(*chunk), _Alignof(lt_chunk_t));
+    if (chunk == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(chunk, 0, sizeof(*chunk));
+
+    chunk->capacity = archetype->rows_per_chunk;
+    if (chunk->capacity == 0u) {
+        chunk->capacity = 1u;
+    }
+
+    if (sizeof(*chunk->entities) > SIZE_MAX / chunk->capacity) {
+        lt_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(lt_chunk_t));
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    chunk->entities = (lt_entity_t*)lt_alloc_bytes(
+        &world->allocator,
+        sizeof(*chunk->entities) * (size_t)chunk->capacity,
+        _Alignof(lt_entity_t));
+    if (chunk->entities == NULL) {
+        lt_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(lt_chunk_t));
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(chunk->entities, 0, sizeof(*chunk->entities) * (size_t)chunk->capacity);
+
+    if (archetype->component_count > 0u) {
+        if (sizeof(*chunk->columns) > SIZE_MAX / archetype->component_count) {
+            lt_free_bytes(
+                &world->allocator,
+                chunk->entities,
+                sizeof(*chunk->entities) * (size_t)chunk->capacity,
+                _Alignof(lt_entity_t));
+            lt_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(lt_chunk_t));
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+
+        chunk->columns = (uint8_t**)lt_alloc_bytes(
+            &world->allocator,
+            sizeof(*chunk->columns) * (size_t)archetype->component_count,
+            _Alignof(uint8_t*));
+        if (chunk->columns == NULL) {
+            lt_free_bytes(
+                &world->allocator,
+                chunk->entities,
+                sizeof(*chunk->entities) * (size_t)chunk->capacity,
+                _Alignof(lt_entity_t));
+            lt_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(lt_chunk_t));
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+        memset(chunk->columns, 0, sizeof(*chunk->columns) * (size_t)archetype->component_count);
+
+        for (i = 0u; i < archetype->component_count; ++i) {
+            lt_component_id_t component_id;
+            const lt_component_record_t* component;
+            size_t column_size;
+
+            component_id = archetype->component_ids[i];
+            component = &world->components[component_id];
+            if (component->size == 0u) {
+                continue;
+            }
+
+            if (component->size > SIZE_MAX / chunk->capacity) {
+                break;
+            }
+
+            column_size = (size_t)component->size * (size_t)chunk->capacity;
+            chunk->columns[i] = (uint8_t*)lt_alloc_bytes(
+                &world->allocator,
+                column_size,
+                component->align);
+            if (chunk->columns[i] == NULL) {
+                break;
+            }
+            memset(chunk->columns[i], 0, column_size);
+        }
+
+        if (i != archetype->component_count) {
+            uint32_t j;
+            for (j = 0u; j < i; ++j) {
+                lt_component_id_t component_id;
+                const lt_component_record_t* component;
+
+                component_id = archetype->component_ids[j];
+                component = &world->components[component_id];
+                if (component->size > 0u) {
+                    lt_free_bytes(
+                        &world->allocator,
+                        chunk->columns[j],
+                        (size_t)component->size * (size_t)chunk->capacity,
+                        component->align);
+                }
+            }
+
+            lt_free_bytes(
+                &world->allocator,
+                chunk->columns,
+                sizeof(*chunk->columns) * (size_t)archetype->component_count,
+                _Alignof(uint8_t*));
+            lt_free_bytes(
+                &world->allocator,
+                chunk->entities,
+                sizeof(*chunk->entities) * (size_t)chunk->capacity,
+                _Alignof(lt_entity_t));
+            lt_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(lt_chunk_t));
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+    }
+
+    *out_chunk = chunk;
+    return LT_STATUS_OK;
+}
+
+static void lt_chunk_destroy(
+    lt_world_t* world,
+    const lt_archetype_t* archetype,
+    lt_chunk_t* chunk,
+    int destroy_live_rows)
+{
+    uint32_t i;
+
+    if (world == NULL || archetype == NULL || chunk == NULL) {
+        return;
+    }
+
+    if (destroy_live_rows != 0u && chunk->count > 0u) {
+        uint32_t row;
+        for (row = 0u; row < chunk->count; ++row) {
+            for (i = 0u; i < archetype->component_count; ++i) {
+                lt_component_id_t component_id;
+                const lt_component_record_t* component;
+                void* ptr;
+
+                component_id = archetype->component_ids[i];
+                component = &world->components[component_id];
+                if (component->dtor == NULL || component->size == 0u) {
+                    continue;
+                }
+
+                ptr = lt_chunk_component_ptr(world, archetype, chunk, row, i);
+                lt_component_destruct_one(component, ptr);
+            }
+        }
+    }
+
+    if (chunk->columns != NULL) {
+        for (i = 0u; i < archetype->component_count; ++i) {
+            lt_component_id_t component_id;
+            const lt_component_record_t* component;
+
+            component_id = archetype->component_ids[i];
+            component = &world->components[component_id];
+            if (component->size > 0u && chunk->columns[i] != NULL) {
+                lt_free_bytes(
+                    &world->allocator,
+                    chunk->columns[i],
+                    (size_t)component->size * (size_t)chunk->capacity,
+                    component->align);
+            }
+        }
+
+        lt_free_bytes(
+            &world->allocator,
+            chunk->columns,
+            sizeof(*chunk->columns) * (size_t)archetype->component_count,
+            _Alignof(uint8_t*));
+    }
+
+    if (chunk->entities != NULL) {
+        lt_free_bytes(
+            &world->allocator,
+            chunk->entities,
+            sizeof(*chunk->entities) * (size_t)chunk->capacity,
+            _Alignof(lt_entity_t));
+    }
+
+    lt_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(lt_chunk_t));
+}
+
+static lt_status_t lt_archetype_alloc_row(
+    lt_world_t* world,
+    lt_archetype_t* archetype,
+    lt_chunk_t** out_chunk,
+    uint32_t* out_row)
+{
+    lt_chunk_t* chunk;
+
+    if (world == NULL || archetype == NULL || out_chunk == NULL || out_row == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    chunk = archetype->chunks;
+    while (chunk != NULL) {
+        if (chunk->count < chunk->capacity) {
+            *out_chunk = chunk;
+            *out_row = chunk->count;
+            chunk->count += 1u;
+            return LT_STATUS_OK;
+        }
+        chunk = chunk->next;
+    }
+
+    {
+        lt_status_t status;
+        status = lt_chunk_create(world, archetype, &chunk);
+        if (status != LT_STATUS_OK) {
+            return status;
+        }
+    }
+
+    if (archetype->chunk_tail != NULL) {
+        archetype->chunk_tail->next = chunk;
+    } else {
+        archetype->chunks = chunk;
+    }
+    archetype->chunk_tail = chunk;
+    archetype->chunk_count += 1u;
+    world->total_chunk_count += 1u;
+
+    *out_chunk = chunk;
+    *out_row = 0u;
+    chunk->count = 1u;
+    return LT_STATUS_OK;
+}
+
+static void lt_archetype_swap_remove_row(
+    lt_world_t* world,
+    lt_archetype_t* archetype,
+    lt_chunk_t* chunk,
+    uint32_t row)
+{
+    uint32_t last_row;
+    uint32_t i;
+
+    if (world == NULL || archetype == NULL || chunk == NULL || chunk->count == 0u || row >= chunk->count) {
+        return;
+    }
+
+    last_row = chunk->count - 1u;
+    if (row != last_row) {
+        lt_entity_t moved_entity;
+
+        moved_entity = chunk->entities[last_row];
+        chunk->entities[row] = moved_entity;
+
+        for (i = 0u; i < archetype->component_count; ++i) {
+            lt_component_id_t component_id;
+            const lt_component_record_t* component;
+            void* dst_ptr;
+            void* src_ptr;
+
+            component_id = archetype->component_ids[i];
+            component = &world->components[component_id];
+            if (component->size == 0u) {
+                continue;
+            }
+
+            dst_ptr = lt_chunk_component_ptr(world, archetype, chunk, row, i);
+            src_ptr = lt_chunk_component_ptr(world, archetype, chunk, last_row, i);
+            lt_component_transfer(component, dst_ptr, src_ptr);
+        }
+
+        {
+            uint32_t moved_index;
+            lt_entity_slot_t* moved_slot;
+
+            moved_index = lt_entity_index(moved_entity);
+            if (moved_index < world->entity_count) {
+                moved_slot = &world->entities[moved_index];
+                moved_slot->archetype = archetype;
+                moved_slot->chunk = chunk;
+                moved_slot->row = row;
+            }
+        }
+    }
+
+    chunk->count -= 1u;
+}
+
+static lt_status_t lt_world_get_live_slot(
+    const lt_world_t* world,
+    lt_entity_t entity,
+    lt_entity_slot_t** out_slot)
+{
+    uint32_t index;
+    uint32_t generation;
+    lt_entity_slot_t* slot;
+
+    if (world == NULL || out_slot == NULL || entity == LT_ENTITY_NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    index = lt_entity_index(entity);
+    generation = lt_entity_generation(entity);
+    if (index >= world->entity_count) {
+        return LT_STATUS_STALE_ENTITY;
+    }
+
+    slot = &((lt_world_t*)world)->entities[index];
+    if (slot->alive == 0u || slot->generation != generation) {
+        return LT_STATUS_STALE_ENTITY;
+    }
+
+    *out_slot = slot;
+    return LT_STATUS_OK;
+}
+
+static lt_status_t lt_world_component_key_with_add(
+    lt_world_t* world,
+    const lt_archetype_t* archetype,
+    lt_component_id_t add_id,
+    lt_component_id_t** out_ids,
+    uint32_t* out_count)
+{
+    lt_component_id_t* ids;
+    uint32_t i;
+    uint32_t src_i;
+    uint32_t dst_i;
+    uint32_t count;
+
+    if (world == NULL || archetype == NULL || out_ids == NULL || out_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    count = archetype->component_count + 1u;
+    if (sizeof(*ids) > SIZE_MAX / count) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    ids = (lt_component_id_t*)lt_alloc_bytes(
+        &world->allocator,
+        sizeof(*ids) * (size_t)count,
+        _Alignof(lt_component_id_t));
+    if (ids == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+
+    src_i = 0u;
+    dst_i = 0u;
+    for (i = 0u; i < count; ++i) {
+        if (src_i >= archetype->component_count
+            || (dst_i == 0u && add_id < archetype->component_ids[src_i])) {
+            ids[i] = add_id;
+            dst_i = 1u;
+        } else {
+            ids[i] = archetype->component_ids[src_i];
+            src_i += 1u;
+        }
+    }
+
+    if (dst_i == 0u) {
+        ids[count - 1u] = add_id;
+    }
+
+    *out_ids = ids;
+    *out_count = count;
+    return LT_STATUS_OK;
+}
+
+static lt_status_t lt_world_component_key_with_remove(
+    lt_world_t* world,
+    const lt_archetype_t* archetype,
+    lt_component_id_t remove_id,
+    lt_component_id_t** out_ids,
+    uint32_t* out_count)
+{
+    lt_component_id_t* ids;
+    uint32_t i;
+    uint32_t dst_i;
+    uint32_t count;
+
+    if (world == NULL || archetype == NULL || out_ids == NULL || out_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (archetype->component_count == 0u) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    count = archetype->component_count - 1u;
+    ids = NULL;
+
+    if (count > 0u) {
+        if (sizeof(*ids) > SIZE_MAX / count) {
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+
+        ids = (lt_component_id_t*)lt_alloc_bytes(
+            &world->allocator,
+            sizeof(*ids) * (size_t)count,
+            _Alignof(lt_component_id_t));
+        if (ids == NULL) {
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+    }
+
+    dst_i = 0u;
+    for (i = 0u; i < archetype->component_count; ++i) {
+        if (archetype->component_ids[i] == remove_id) {
+            continue;
+        }
+        if (ids != NULL) {
+            ids[dst_i] = archetype->component_ids[i];
+        }
+        dst_i += 1u;
+    }
+
+    *out_ids = ids;
+    *out_count = count;
+    return LT_STATUS_OK;
+}
+
 const char* lt_status_string(lt_status_t status)
 {
     switch (status) {
@@ -358,6 +1124,7 @@ lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world
     if (cfg != NULL) {
         local_cfg = *cfg;
     }
+
     status = lt_prepare_allocator(cfg, &allocator);
     if (status != LT_STATUS_OK) {
         return status;
@@ -371,7 +1138,10 @@ lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world
         return LT_STATUS_ALLOCATION_FAILED;
     }
     memset(world, 0, sizeof(*world));
+
     world->allocator = allocator;
+    world->target_chunk_bytes =
+        local_cfg.target_chunk_bytes == 0u ? LT_DEFAULT_CHUNK_BYTES : local_cfg.target_chunk_bytes;
     world->free_entity_head = UINT32_MAX;
 
     if (local_cfg.initial_entity_capacity > 0u) {
@@ -390,6 +1160,12 @@ lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world
         }
     }
 
+    status = lt_find_or_create_archetype(world, NULL, 0u, &world->root_archetype);
+    if (status != LT_STATUS_OK) {
+        lt_world_destroy(world);
+        return status;
+    }
+
     *out_world = world;
     return LT_STATUS_OK;
 }
@@ -402,11 +1178,55 @@ void lt_world_destroy(lt_world_t* world)
         return;
     }
 
+    if (world->archetypes != NULL) {
+        for (i = 0u; i < world->archetype_count; ++i) {
+            lt_archetype_t* archetype;
+            lt_chunk_t* chunk;
+
+            archetype = world->archetypes[i];
+            if (archetype == NULL) {
+                continue;
+            }
+
+            chunk = archetype->chunks;
+            while (chunk != NULL) {
+                lt_chunk_t* next;
+                next = chunk->next;
+                lt_chunk_destroy(world, archetype, chunk, 1);
+                chunk = next;
+            }
+
+            if (archetype->component_ids != NULL) {
+                lt_free_bytes(
+                    &world->allocator,
+                    archetype->component_ids,
+                    sizeof(*archetype->component_ids) * (size_t)archetype->component_count,
+                    _Alignof(lt_component_id_t));
+            }
+
+            lt_free_bytes(
+                &world->allocator,
+                archetype,
+                sizeof(*archetype),
+                _Alignof(lt_archetype_t));
+        }
+
+        lt_free_bytes(
+            &world->allocator,
+            world->archetypes,
+            sizeof(*world->archetypes) * (size_t)world->archetype_capacity,
+            _Alignof(lt_archetype_t*));
+        world->archetypes = NULL;
+    }
+
     if (world->components != NULL) {
         for (i = 1u; i <= world->component_count; ++i) {
-            lt_component_record_t* record = &world->components[i];
+            lt_component_record_t* record;
+
+            record = &world->components[i];
             if (record->name != NULL) {
-                size_t name_size = strlen(record->name) + 1u;
+                size_t name_size;
+                name_size = strlen(record->name) + 1u;
                 lt_free_bytes(
                     &world->allocator,
                     record->name,
@@ -459,20 +1279,23 @@ lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity)
     uint32_t index;
     uint32_t generation;
     lt_entity_slot_t* slot;
+    lt_entity_t entity;
+    lt_chunk_t* chunk;
+    uint32_t row;
     lt_status_t status;
+    uint8_t reused_slot;
 
     if (world == NULL || out_entity == NULL) {
         return LT_STATUS_INVALID_ARGUMENT;
     }
 
+    reused_slot = 0u;
     if (world->free_entity_head != UINT32_MAX) {
         index = world->free_entity_head;
         slot = &world->entities[index];
         world->free_entity_head = slot->next_free;
         world->free_entity_count -= 1u;
-
-        slot->alive = 1u;
-        slot->next_free = UINT32_MAX;
+        reused_slot = 1u;
     } else {
         if (world->entity_count == world->entity_capacity) {
             status = lt_grow_entities(world, world->entity_count + 1u);
@@ -484,40 +1307,80 @@ lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity)
         index = world->entity_count;
         world->entity_count += 1u;
         slot = &world->entities[index];
-        slot->alive = 1u;
-        slot->next_free = UINT32_MAX;
-        if (slot->generation == 0u) {
-            slot->generation = 1u;
-        }
+        memset(slot, 0, sizeof(*slot));
+    }
+
+    if (slot->generation == 0u) {
+        slot->generation = 1u;
     }
 
     generation = slot->generation;
+    entity = lt_entity_pack(index, generation);
+
+    status = lt_archetype_alloc_row(world, world->root_archetype, &chunk, &row);
+    if (status != LT_STATUS_OK) {
+        if (reused_slot != 0u) {
+            slot->next_free = world->free_entity_head;
+            world->free_entity_head = index;
+            world->free_entity_count += 1u;
+        } else {
+            world->entity_count -= 1u;
+            memset(slot, 0, sizeof(*slot));
+        }
+        return status;
+    }
+
+    chunk->entities[row] = entity;
+
+    slot->alive = 1u;
+    slot->next_free = UINT32_MAX;
+    slot->archetype = world->root_archetype;
+    slot->chunk = chunk;
+    slot->row = row;
+
     world->live_entity_count += 1u;
-    *out_entity = lt_entity_pack(index, generation);
+    *out_entity = entity;
     return LT_STATUS_OK;
 }
 
 lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity)
 {
-    uint32_t index;
-    uint32_t generation;
     lt_entity_slot_t* slot;
+    lt_archetype_t* archetype;
+    lt_chunk_t* chunk;
+    uint32_t row;
+    uint32_t i;
+    lt_status_t status;
 
     if (world == NULL || entity == LT_ENTITY_NULL) {
         return LT_STATUS_INVALID_ARGUMENT;
     }
 
-    index = lt_entity_index(entity);
-    generation = lt_entity_generation(entity);
-
-    if (index >= world->entity_count) {
-        return LT_STATUS_STALE_ENTITY;
+    status = lt_world_get_live_slot(world, entity, &slot);
+    if (status != LT_STATUS_OK) {
+        return status;
     }
 
-    slot = &world->entities[index];
-    if (slot->alive == 0u || slot->generation != generation) {
-        return LT_STATUS_STALE_ENTITY;
+    archetype = slot->archetype;
+    chunk = slot->chunk;
+    row = slot->row;
+
+    for (i = 0u; i < archetype->component_count; ++i) {
+        lt_component_id_t component_id;
+        const lt_component_record_t* component;
+        void* ptr;
+
+        component_id = archetype->component_ids[i];
+        component = &world->components[component_id];
+        if (component->dtor == NULL || component->size == 0u) {
+            continue;
+        }
+
+        ptr = lt_chunk_component_ptr(world, archetype, chunk, row, i);
+        lt_component_destruct_one(component, ptr);
     }
+
+    lt_archetype_swap_remove_row(world, archetype, chunk, row);
 
     slot->alive = 0u;
     slot->generation += 1u;
@@ -525,8 +1388,12 @@ lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity)
         slot->generation = 1u;
     }
 
+    slot->archetype = NULL;
+    slot->chunk = NULL;
+    slot->row = 0u;
+
     slot->next_free = world->free_entity_head;
-    world->free_entity_head = index;
+    world->free_entity_head = lt_entity_index(entity);
     world->free_entity_count += 1u;
 
     if (world->live_entity_count > 0u) {
@@ -556,6 +1423,261 @@ lt_status_t lt_entity_is_alive(const lt_world_t* world, lt_entity_t entity, uint
 
     slot = &world->entities[index];
     *out_alive = (uint8_t)(slot->alive != 0u && slot->generation == generation);
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_add_component(
+    lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    const void* initial_value)
+{
+    lt_entity_slot_t* slot;
+    lt_archetype_t* src_archetype;
+    lt_chunk_t* src_chunk;
+    uint32_t src_row;
+    lt_component_id_t* dst_ids;
+    uint32_t dst_count;
+    lt_archetype_t* dst_archetype;
+    lt_chunk_t* dst_chunk;
+    uint32_t dst_row;
+    uint32_t i;
+    lt_status_t status;
+
+    if (world == NULL || entity == LT_ENTITY_NULL || component_id == LT_COMPONENT_INVALID) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (component_id > world->component_count) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    status = lt_world_get_live_slot(world, entity, &slot);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    src_archetype = slot->archetype;
+    src_chunk = slot->chunk;
+    src_row = slot->row;
+
+    if (lt_archetype_find_component_index(src_archetype, component_id, NULL)) {
+        return LT_STATUS_ALREADY_EXISTS;
+    }
+
+    dst_ids = NULL;
+    dst_count = 0u;
+    status = lt_world_component_key_with_add(world, src_archetype, component_id, &dst_ids, &dst_count);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_find_or_create_archetype(world, dst_ids, dst_count, &dst_archetype);
+    if (dst_ids != NULL) {
+        lt_free_bytes(
+            &world->allocator,
+            dst_ids,
+            sizeof(*dst_ids) * (size_t)dst_count,
+            _Alignof(lt_component_id_t));
+    }
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_archetype_alloc_row(world, dst_archetype, &dst_chunk, &dst_row);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    dst_chunk->entities[dst_row] = entity;
+
+    for (i = 0u; i < dst_archetype->component_count; ++i) {
+        lt_component_id_t dst_component_id;
+        const lt_component_record_t* component;
+        void* dst_ptr;
+
+        dst_component_id = dst_archetype->component_ids[i];
+        component = &world->components[dst_component_id];
+        dst_ptr = lt_chunk_component_ptr(world, dst_archetype, dst_chunk, dst_row, i);
+
+        if (dst_component_id == component_id) {
+            lt_component_init_added(component, dst_ptr, initial_value);
+        } else {
+            uint32_t src_i;
+            void* src_ptr;
+
+            (void)lt_archetype_find_component_index(src_archetype, dst_component_id, &src_i);
+            src_ptr = lt_chunk_component_ptr(world, src_archetype, src_chunk, src_row, src_i);
+            lt_component_transfer(component, dst_ptr, src_ptr);
+        }
+    }
+
+    slot->archetype = dst_archetype;
+    slot->chunk = dst_chunk;
+    slot->row = dst_row;
+
+    lt_archetype_swap_remove_row(world, src_archetype, src_chunk, src_row);
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_remove_component(
+    lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id)
+{
+    lt_entity_slot_t* slot;
+    lt_archetype_t* src_archetype;
+    lt_chunk_t* src_chunk;
+    uint32_t src_row;
+    lt_component_id_t* dst_ids;
+    uint32_t dst_count;
+    lt_archetype_t* dst_archetype;
+    lt_chunk_t* dst_chunk;
+    uint32_t dst_row;
+    uint32_t removed_index;
+    uint32_t i;
+    lt_status_t status;
+
+    if (world == NULL || entity == LT_ENTITY_NULL || component_id == LT_COMPONENT_INVALID) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (component_id > world->component_count) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    status = lt_world_get_live_slot(world, entity, &slot);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    src_archetype = slot->archetype;
+    src_chunk = slot->chunk;
+    src_row = slot->row;
+
+    if (!lt_archetype_find_component_index(src_archetype, component_id, &removed_index)) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    dst_ids = NULL;
+    dst_count = 0u;
+    status = lt_world_component_key_with_remove(world, src_archetype, component_id, &dst_ids, &dst_count);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_find_or_create_archetype(world, dst_ids, dst_count, &dst_archetype);
+    if (dst_ids != NULL) {
+        lt_free_bytes(
+            &world->allocator,
+            dst_ids,
+            sizeof(*dst_ids) * (size_t)dst_count,
+            _Alignof(lt_component_id_t));
+    }
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_archetype_alloc_row(world, dst_archetype, &dst_chunk, &dst_row);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    dst_chunk->entities[dst_row] = entity;
+
+    for (i = 0u; i < dst_archetype->component_count; ++i) {
+        lt_component_id_t dst_component_id;
+        const lt_component_record_t* component;
+        uint32_t src_i;
+        void* src_ptr;
+        void* dst_ptr;
+
+        dst_component_id = dst_archetype->component_ids[i];
+        component = &world->components[dst_component_id];
+        (void)lt_archetype_find_component_index(src_archetype, dst_component_id, &src_i);
+
+        src_ptr = lt_chunk_component_ptr(world, src_archetype, src_chunk, src_row, src_i);
+        dst_ptr = lt_chunk_component_ptr(world, dst_archetype, dst_chunk, dst_row, i);
+        lt_component_transfer(component, dst_ptr, src_ptr);
+    }
+
+    {
+        const lt_component_record_t* removed_component;
+        void* removed_ptr;
+
+        removed_component = &world->components[component_id];
+        removed_ptr = lt_chunk_component_ptr(world, src_archetype, src_chunk, src_row, removed_index);
+        lt_component_destruct_one(removed_component, removed_ptr);
+    }
+
+    slot->archetype = dst_archetype;
+    slot->chunk = dst_chunk;
+    slot->row = dst_row;
+
+    lt_archetype_swap_remove_row(world, src_archetype, src_chunk, src_row);
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_has_component(
+    const lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    uint8_t* out_has)
+{
+    lt_entity_slot_t* slot;
+    lt_status_t status;
+
+    if (world == NULL || out_has == NULL || entity == LT_ENTITY_NULL || component_id == LT_COMPONENT_INVALID) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (component_id > world->component_count) {
+        *out_has = 0u;
+        return LT_STATUS_OK;
+    }
+
+    status = lt_world_get_live_slot(world, entity, &slot);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    *out_has = (uint8_t)lt_archetype_find_component_index(slot->archetype, component_id, NULL);
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_get_component(
+    lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    void** out_ptr)
+{
+    lt_entity_slot_t* slot;
+    uint32_t component_index;
+    lt_status_t status;
+
+    if (world == NULL
+        || out_ptr == NULL
+        || entity == LT_ENTITY_NULL
+        || component_id == LT_COMPONENT_INVALID) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_ptr = NULL;
+
+    if (component_id > world->component_count) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    status = lt_world_get_live_slot(world, entity, &slot);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    if (!lt_archetype_find_component_index(slot->archetype, component_id, &component_index)) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    *out_ptr = lt_chunk_component_ptr(world, slot->archetype, slot->chunk, slot->row, component_index);
     return LT_STATUS_OK;
 }
 
@@ -603,7 +1725,7 @@ lt_status_t lt_register_component(
     }
 
     record->size = desc->size;
-    record->align = desc->align;
+    record->align = desc->align == 0u ? 1u : desc->align;
     record->flags = desc->flags;
     record->ctor = desc->ctor;
     record->dtor = desc->dtor;
@@ -626,5 +1748,7 @@ lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_st
     out_stats->allocated_entity_slots = world->entity_count;
     out_stats->free_entity_slots = world->free_entity_count;
     out_stats->registered_components = world->component_count;
+    out_stats->archetype_count = world->archetype_count;
+    out_stats->chunk_count = world->total_chunk_count;
     return LT_STATUS_OK;
 }

@@ -46,6 +46,7 @@ typedef struct lt_world_config_s {
     lt_allocator_t allocator;
     uint32_t initial_entity_capacity;
     uint32_t initial_component_capacity;
+    uint32_t target_chunk_bytes;
 } lt_world_config_t;
 
 typedef struct lt_world_stats_s {
@@ -54,6 +55,8 @@ typedef struct lt_world_stats_s {
     uint32_t allocated_entity_slots;
     uint32_t free_entity_slots;
     uint32_t registered_components;
+    uint32_t archetype_count;
+    uint32_t chunk_count;
 } lt_world_stats_t;
 
 lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world);
@@ -65,6 +68,29 @@ lt_status_t lt_world_reserve_components(lt_world_t* world, uint32_t component_ca
 lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity);
 lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity);
 lt_status_t lt_entity_is_alive(const lt_world_t* world, lt_entity_t entity, uint8_t* out_alive);
+
+lt_status_t lt_add_component(
+    lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    const void* initial_value);
+
+lt_status_t lt_remove_component(
+    lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id);
+
+lt_status_t lt_has_component(
+    const lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    uint8_t* out_has);
+
+lt_status_t lt_get_component(
+    lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    void** out_ptr);
 
 lt_status_t lt_register_component(
     lt_world_t* world,

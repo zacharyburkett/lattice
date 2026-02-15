@@ -3,7 +3,7 @@
 Lattice is a high-performance Entity-Component-System (ECS) framework in C for
 the Ardent engine ecosystem.
 
-Status: early implementation. Phase 1 core runtime is in place.
+Status: early implementation. Phase 2 archetype/chunk storage is now in place.
 
 ## Design Intent
 
@@ -25,8 +25,11 @@ Status: early implementation. Phase 1 core runtime is in place.
 - World lifecycle API (`lt_world_create`, `lt_world_destroy`).
 - Entity allocation/destruction with stale-handle protection.
 - Component registration with metadata validation and duplicate-name rejection.
+- Archetype/chunk storage and structural entity moves for component add/remove.
+- Direct component access APIs (`lt_add_component`, `lt_remove_component`,
+  `lt_has_component`, `lt_get_component`).
 - World stats snapshot API.
-- Unit tests for entity lifecycle, growth, and component registry behavior.
+- Unit tests for lifecycle, registration, structural moves, and destructor hooks.
 
 ## Quick Start
 
