@@ -398,6 +398,194 @@ static int test_tag_component_behavior(void)
     return 0;
 }
 
+static int test_query_iteration_and_filters(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t e0;
+    lt_entity_t e1;
+    lt_entity_t e2;
+    lt_entity_t e3;
+    test_vec3_t position;
+    test_vec3_t velocity;
+    lt_query_term_t pos_only_term;
+    lt_query_term_t movable_terms[2];
+    lt_query_desc_t pos_only_desc;
+    lt_query_desc_t movable_desc;
+    lt_query_t* pos_only_query;
+    lt_query_t* movable_query;
+    lt_query_iter_t iter;
+    lt_chunk_view_t view;
+    uint8_t has_value;
+    uint8_t has_pos;
+    uint8_t has_vel;
+    uint32_t count;
+    uint8_t saw_e0;
+    uint8_t saw_e1;
+    uint8_t saw_e2;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    ASSERT_STATUS(lt_entity_create(world, &e0), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_create(world, &e1), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_create(world, &e2), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_create(world, &e3), LT_STATUS_OK);
+
+    position.x = 1.0f;
+    position.y = 2.0f;
+    position.z = 3.0f;
+    velocity.x = 7.0f;
+    velocity.y = 8.0f;
+    velocity.z = 9.0f;
+
+    ASSERT_STATUS(lt_add_component(world, e0, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, e1, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, e1, velocity_id, &velocity), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, e2, velocity_id, &velocity), LT_STATUS_OK);
+
+    memset(&pos_only_term, 0, sizeof(pos_only_term));
+    pos_only_term.component_id = position_id;
+    pos_only_term.access = LT_ACCESS_READ;
+
+    memset(&pos_only_desc, 0, sizeof(pos_only_desc));
+    pos_only_desc.with_terms = &pos_only_term;
+    pos_only_desc.with_count = 1u;
+    pos_only_desc.without = &velocity_id;
+    pos_only_desc.without_count = 1u;
+
+    movable_terms[0].component_id = position_id;
+    movable_terms[0].access = LT_ACCESS_WRITE;
+    movable_terms[1].component_id = velocity_id;
+    movable_terms[1].access = LT_ACCESS_READ;
+
+    memset(&movable_desc, 0, sizeof(movable_desc));
+    movable_desc.with_terms = movable_terms;
+    movable_desc.with_count = 2u;
+
+    ASSERT_STATUS(lt_query_create(world, &pos_only_desc, &pos_only_query), LT_STATUS_OK);
+    ASSERT_STATUS(lt_query_create(world, &movable_desc, &movable_query), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_query_iter_begin(pos_only_query, &iter), LT_STATUS_OK);
+    count = 0u;
+    saw_e0 = 0u;
+    while (1) {
+        ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+        if (has_value == 0u) {
+            break;
+        }
+
+        for (uint32_t i = 0u; i < view.count; ++i) {
+            lt_entity_t entity;
+            entity = view.entities[i];
+            count += 1u;
+            if (entity == e0) {
+                saw_e0 = 1u;
+            }
+            ASSERT_STATUS(lt_has_component(world, entity, position_id, &has_pos), LT_STATUS_OK);
+            ASSERT_STATUS(lt_has_component(world, entity, velocity_id, &has_vel), LT_STATUS_OK);
+            ASSERT_TRUE(has_pos == 1u);
+            ASSERT_TRUE(has_vel == 0u);
+        }
+    }
+    ASSERT_TRUE(count == 1u);
+    ASSERT_TRUE(saw_e0 == 1u);
+
+    ASSERT_STATUS(lt_query_iter_begin(movable_query, &iter), LT_STATUS_OK);
+    count = 0u;
+    saw_e1 = 0u;
+    while (1) {
+        ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+        if (has_value == 0u) {
+            break;
+        }
+
+        for (uint32_t i = 0u; i < view.count; ++i) {
+            lt_entity_t entity;
+            entity = view.entities[i];
+            count += 1u;
+            if (entity == e1) {
+                saw_e1 = 1u;
+            }
+            ASSERT_STATUS(lt_has_component(world, entity, position_id, &has_pos), LT_STATUS_OK);
+            ASSERT_STATUS(lt_has_component(world, entity, velocity_id, &has_vel), LT_STATUS_OK);
+            ASSERT_TRUE(has_pos == 1u);
+            ASSERT_TRUE(has_vel == 1u);
+        }
+    }
+    ASSERT_TRUE(count == 1u);
+    ASSERT_TRUE(saw_e1 == 1u);
+
+    ASSERT_STATUS(lt_add_component(world, e0, velocity_id, &velocity), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_query_iter_begin(movable_query, &iter), LT_STATUS_OK);
+    count = 0u;
+    saw_e0 = 0u;
+    saw_e1 = 0u;
+    saw_e2 = 0u;
+    while (1) {
+        ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+        if (has_value == 0u) {
+            break;
+        }
+
+        for (uint32_t i = 0u; i < view.count; ++i) {
+            lt_entity_t entity;
+            entity = view.entities[i];
+            count += 1u;
+            if (entity == e0) {
+                saw_e0 = 1u;
+            } else if (entity == e1) {
+                saw_e1 = 1u;
+            } else if (entity == e2) {
+                saw_e2 = 1u;
+            }
+        }
+    }
+    ASSERT_TRUE(count == 2u);
+    ASSERT_TRUE(saw_e0 == 1u);
+    ASSERT_TRUE(saw_e1 == 1u);
+    ASSERT_TRUE(saw_e2 == 0u);
+
+    lt_query_destroy(pos_only_query);
+    lt_query_destroy(movable_query);
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int test_query_validation_conflicts(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_query_term_t with_term;
+    lt_query_desc_t desc;
+    lt_query_t* query;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    with_term.component_id = position_id;
+    with_term.access = LT_ACCESS_READ;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.with_terms = &with_term;
+    desc.with_count = 1u;
+    desc.without = &position_id;
+    desc.without_count = 1u;
+    ASSERT_STATUS(lt_query_create(world, &desc, &query), LT_STATUS_CONFLICT);
+
+    with_term.component_id = LT_COMPONENT_INVALID;
+    memset(&desc, 0, sizeof(desc));
+    desc.with_terms = &with_term;
+    desc.with_count = 1u;
+    ASSERT_STATUS(lt_query_create(world, &desc, &query), LT_STATUS_NOT_FOUND);
+
+    lt_world_destroy(world);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_destroy_defaults);
@@ -410,5 +598,7 @@ int main(void)
     RUN_TEST(test_swap_remove_updates_entity_locations);
     RUN_TEST(test_destructors_called_on_remove_destroy_and_world_destroy);
     RUN_TEST(test_tag_component_behavior);
+    RUN_TEST(test_query_iteration_and_filters);
+    RUN_TEST(test_query_validation_conflicts);
     return 0;
 }

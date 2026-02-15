@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 typedef struct lt_world_s lt_world_t;
+typedef struct lt_query_s lt_query_t;
 
 typedef void* (*lt_alloc_fn)(void* user, size_t size, size_t align);
 typedef void (*lt_free_fn)(void* user, void* ptr, size_t size, size_t align);
@@ -59,6 +60,38 @@ typedef struct lt_world_stats_s {
     uint32_t chunk_count;
 } lt_world_stats_t;
 
+typedef enum lt_access_e {
+    LT_ACCESS_READ = 0,
+    LT_ACCESS_WRITE = 1
+} lt_access_t;
+
+typedef struct lt_query_term_s {
+    lt_component_id_t component_id;
+    lt_access_t access;
+} lt_query_term_t;
+
+typedef struct lt_query_desc_s {
+    const lt_query_term_t* with_terms;
+    uint32_t with_count;
+    const lt_component_id_t* without;
+    uint32_t without_count;
+} lt_query_desc_t;
+
+typedef struct lt_chunk_view_s {
+    uint32_t count;
+    const lt_entity_t* entities;
+    void** columns;
+    uint32_t column_count;
+} lt_chunk_view_t;
+
+typedef struct lt_query_iter_s {
+    lt_query_t* query;
+    uint32_t archetype_index;
+    void* chunk_cursor;
+    void** columns;
+    uint32_t column_capacity;
+} lt_query_iter_t;
+
 lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world);
 void lt_world_destroy(lt_world_t* world);
 
@@ -98,6 +131,15 @@ lt_status_t lt_register_component(
     lt_component_id_t* out_id);
 
 lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_stats);
+
+lt_status_t lt_query_create(lt_world_t* world, const lt_query_desc_t* desc, lt_query_t** out_query);
+void lt_query_destroy(lt_query_t* query);
+lt_status_t lt_query_refresh(lt_query_t* query);
+lt_status_t lt_query_iter_begin(lt_query_t* query, lt_query_iter_t* out_iter);
+lt_status_t lt_query_iter_next(
+    lt_query_iter_t* iter,
+    lt_chunk_view_t* out_view,
+    uint8_t* out_has_value);
 
 #ifdef __cplusplus
 }

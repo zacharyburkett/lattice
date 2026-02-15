@@ -75,6 +75,21 @@ struct lt_world_s {
     lt_archetype_t* root_archetype;
 };
 
+struct lt_query_s {
+    lt_world_t* world;
+    lt_query_term_t* with_terms;
+    uint32_t with_count;
+    lt_component_id_t* without;
+    uint32_t without_count;
+    lt_archetype_t** matches;
+    uint32_t match_count;
+    uint32_t match_capacity;
+    void** scratch_columns;
+    uint32_t scratch_capacity;
+};
+
+void lt_query_destroy(lt_query_t* query);
+
 static int lt_is_power_of_two_u32(uint32_t v)
 {
     return v != 0u && (v & (v - 1u)) == 0u;
@@ -1082,6 +1097,234 @@ static lt_status_t lt_world_component_key_with_remove(
     return LT_STATUS_OK;
 }
 
+static lt_status_t lt_query_validate_desc(const lt_world_t* world, const lt_query_desc_t* desc)
+{
+    uint32_t i;
+    uint32_t j;
+
+    if (world == NULL || desc == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if ((desc->with_count > 0u && desc->with_terms == NULL)
+        || (desc->without_count > 0u && desc->without == NULL)) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    for (i = 0u; i < desc->with_count; ++i) {
+        lt_component_id_t component_id;
+
+        component_id = desc->with_terms[i].component_id;
+        if (component_id == LT_COMPONENT_INVALID || component_id > world->component_count) {
+            return LT_STATUS_NOT_FOUND;
+        }
+
+        if (desc->with_terms[i].access != LT_ACCESS_READ
+            && desc->with_terms[i].access != LT_ACCESS_WRITE) {
+            return LT_STATUS_INVALID_ARGUMENT;
+        }
+
+        for (j = i + 1u; j < desc->with_count; ++j) {
+            if (desc->with_terms[j].component_id == component_id) {
+                return LT_STATUS_CONFLICT;
+            }
+        }
+    }
+
+    for (i = 0u; i < desc->without_count; ++i) {
+        lt_component_id_t component_id;
+
+        component_id = desc->without[i];
+        if (component_id == LT_COMPONENT_INVALID || component_id > world->component_count) {
+            return LT_STATUS_NOT_FOUND;
+        }
+
+        for (j = i + 1u; j < desc->without_count; ++j) {
+            if (desc->without[j] == component_id) {
+                return LT_STATUS_CONFLICT;
+            }
+        }
+
+        for (j = 0u; j < desc->with_count; ++j) {
+            if (desc->with_terms[j].component_id == component_id) {
+                return LT_STATUS_CONFLICT;
+            }
+        }
+    }
+
+    return LT_STATUS_OK;
+}
+
+static lt_status_t lt_query_copy_desc(lt_query_t* query, const lt_query_desc_t* desc)
+{
+    lt_world_t* world;
+
+    if (query == NULL || query->world == NULL || desc == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    world = query->world;
+
+    if (desc->with_count > 0u) {
+        if (sizeof(*query->with_terms) > SIZE_MAX / desc->with_count) {
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+
+        query->with_terms = (lt_query_term_t*)lt_alloc_bytes(
+            &world->allocator,
+            sizeof(*query->with_terms) * (size_t)desc->with_count,
+            _Alignof(lt_query_term_t));
+        if (query->with_terms == NULL) {
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+        memcpy(
+            query->with_terms,
+            desc->with_terms,
+            sizeof(*query->with_terms) * (size_t)desc->with_count);
+        query->with_count = desc->with_count;
+    }
+
+    if (desc->without_count > 0u) {
+        if (sizeof(*query->without) > SIZE_MAX / desc->without_count) {
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+
+        query->without = (lt_component_id_t*)lt_alloc_bytes(
+            &world->allocator,
+            sizeof(*query->without) * (size_t)desc->without_count,
+            _Alignof(lt_component_id_t));
+        if (query->without == NULL) {
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+        memcpy(
+            query->without,
+            desc->without,
+            sizeof(*query->without) * (size_t)desc->without_count);
+        query->without_count = desc->without_count;
+    }
+
+    return LT_STATUS_OK;
+}
+
+static int lt_query_matches_archetype(const lt_query_t* query, const lt_archetype_t* archetype)
+{
+    uint32_t i;
+
+    if (query == NULL || archetype == NULL) {
+        return 0;
+    }
+
+    for (i = 0u; i < query->with_count; ++i) {
+        if (!lt_archetype_find_component_index(
+                archetype,
+                query->with_terms[i].component_id,
+                NULL)) {
+            return 0;
+        }
+    }
+
+    for (i = 0u; i < query->without_count; ++i) {
+        if (lt_archetype_find_component_index(archetype, query->without[i], NULL)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static lt_status_t lt_query_ensure_match_capacity(lt_query_t* query, uint32_t min_capacity)
+{
+    lt_world_t* world;
+    lt_archetype_t** new_matches;
+    size_t old_size;
+    size_t new_size;
+
+    if (query == NULL || query->world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (query->match_capacity >= min_capacity) {
+        return LT_STATUS_OK;
+    }
+
+    if (sizeof(*new_matches) > SIZE_MAX / (size_t)min_capacity) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    world = query->world;
+    new_size = sizeof(*new_matches) * (size_t)min_capacity;
+    new_matches = (lt_archetype_t**)lt_alloc_bytes(
+        &world->allocator,
+        new_size,
+        _Alignof(lt_archetype_t*));
+    if (new_matches == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(new_matches, 0, new_size);
+
+    if (query->matches != NULL && query->match_count > 0u) {
+        old_size = sizeof(*new_matches) * (size_t)query->match_count;
+        memcpy(new_matches, query->matches, old_size);
+    }
+
+    if (query->matches != NULL) {
+        lt_free_bytes(
+            &world->allocator,
+            query->matches,
+            sizeof(*query->matches) * (size_t)query->match_capacity,
+            _Alignof(lt_archetype_t*));
+    }
+
+    query->matches = new_matches;
+    query->match_capacity = min_capacity;
+    return LT_STATUS_OK;
+}
+
+static lt_status_t lt_query_ensure_scratch_capacity(lt_query_t* query, uint32_t min_capacity)
+{
+    lt_world_t* world;
+    void** new_columns;
+    size_t new_size;
+
+    if (query == NULL || query->world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (min_capacity == 0u || query->scratch_capacity >= min_capacity) {
+        return LT_STATUS_OK;
+    }
+
+    if (sizeof(*new_columns) > SIZE_MAX / (size_t)min_capacity) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    world = query->world;
+    new_size = sizeof(*new_columns) * (size_t)min_capacity;
+    new_columns = (void**)lt_alloc_bytes(&world->allocator, new_size, _Alignof(void*));
+    if (new_columns == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(new_columns, 0, new_size);
+
+    if (query->scratch_columns != NULL) {
+        if (query->scratch_capacity > 0u) {
+            memcpy(
+                new_columns,
+                query->scratch_columns,
+                sizeof(*new_columns) * (size_t)query->scratch_capacity);
+        }
+        lt_free_bytes(
+            &world->allocator,
+            query->scratch_columns,
+            sizeof(*query->scratch_columns) * (size_t)query->scratch_capacity,
+            _Alignof(void*));
+    }
+
+    query->scratch_columns = new_columns;
+    query->scratch_capacity = min_capacity;
+    return LT_STATUS_OK;
+}
+
 const char* lt_status_string(lt_status_t status)
 {
     switch (status) {
@@ -1734,6 +1977,242 @@ lt_status_t lt_register_component(
 
     world->component_count = id;
     *out_id = id;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_query_create(lt_world_t* world, const lt_query_desc_t* desc, lt_query_t** out_query)
+{
+    lt_query_t* query;
+    lt_status_t status;
+
+    if (world == NULL || desc == NULL || out_query == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    *out_query = NULL;
+
+    status = lt_query_validate_desc(world, desc);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    query = (lt_query_t*)lt_alloc_bytes(&world->allocator, sizeof(*query), _Alignof(lt_query_t));
+    if (query == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(query, 0, sizeof(*query));
+    query->world = world;
+
+    status = lt_query_copy_desc(query, desc);
+    if (status != LT_STATUS_OK) {
+        lt_query_destroy(query);
+        return status;
+    }
+
+    status = lt_query_ensure_scratch_capacity(query, query->with_count);
+    if (status != LT_STATUS_OK) {
+        lt_query_destroy(query);
+        return status;
+    }
+
+    status = lt_query_refresh(query);
+    if (status != LT_STATUS_OK) {
+        lt_query_destroy(query);
+        return status;
+    }
+
+    *out_query = query;
+    return LT_STATUS_OK;
+}
+
+void lt_query_destroy(lt_query_t* query)
+{
+    lt_world_t* world;
+
+    if (query == NULL) {
+        return;
+    }
+
+    world = query->world;
+    if (world != NULL) {
+        if (query->with_terms != NULL) {
+            lt_free_bytes(
+                &world->allocator,
+                query->with_terms,
+                sizeof(*query->with_terms) * (size_t)query->with_count,
+                _Alignof(lt_query_term_t));
+        }
+        if (query->without != NULL) {
+            lt_free_bytes(
+                &world->allocator,
+                query->without,
+                sizeof(*query->without) * (size_t)query->without_count,
+                _Alignof(lt_component_id_t));
+        }
+        if (query->matches != NULL) {
+            lt_free_bytes(
+                &world->allocator,
+                query->matches,
+                sizeof(*query->matches) * (size_t)query->match_capacity,
+                _Alignof(lt_archetype_t*));
+        }
+        if (query->scratch_columns != NULL) {
+            lt_free_bytes(
+                &world->allocator,
+                query->scratch_columns,
+                sizeof(*query->scratch_columns) * (size_t)query->scratch_capacity,
+                _Alignof(void*));
+        }
+        lt_free_bytes(&world->allocator, query, sizeof(*query), _Alignof(lt_query_t));
+    }
+}
+
+lt_status_t lt_query_refresh(lt_query_t* query)
+{
+    lt_world_t* world;
+    uint32_t i;
+    lt_status_t status;
+
+    if (query == NULL || query->world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    world = query->world;
+    status = lt_query_ensure_match_capacity(query, world->archetype_count);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    query->match_count = 0u;
+    for (i = 0u; i < world->archetype_count; ++i) {
+        lt_archetype_t* archetype;
+
+        archetype = world->archetypes[i];
+        if (archetype == NULL) {
+            continue;
+        }
+
+        if (lt_query_matches_archetype(query, archetype)) {
+            query->matches[query->match_count] = archetype;
+            query->match_count += 1u;
+        }
+    }
+
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_query_iter_begin(lt_query_t* query, lt_query_iter_t* out_iter)
+{
+    lt_status_t status;
+
+    if (query == NULL || out_iter == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    status = lt_query_refresh(query);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_query_ensure_scratch_capacity(query, query->with_count);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    memset(out_iter, 0, sizeof(*out_iter));
+    out_iter->query = query;
+    out_iter->archetype_index = 0u;
+    out_iter->chunk_cursor = NULL;
+    out_iter->columns = query->scratch_columns;
+    out_iter->column_capacity = query->scratch_capacity;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_query_iter_next(
+    lt_query_iter_t* iter,
+    lt_chunk_view_t* out_view,
+    uint8_t* out_has_value)
+{
+    lt_query_t* query;
+    lt_world_t* world;
+    lt_status_t status;
+
+    if (iter == NULL || out_view == NULL || out_has_value == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    query = iter->query;
+    if (query == NULL || query->world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    world = query->world;
+
+    out_view->count = 0u;
+    out_view->entities = NULL;
+    out_view->columns = NULL;
+    out_view->column_count = 0u;
+    *out_has_value = 0u;
+
+    status = lt_query_ensure_scratch_capacity(query, query->with_count);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    while (iter->archetype_index < query->match_count) {
+        lt_archetype_t* archetype;
+        lt_chunk_t* chunk;
+        uint32_t i;
+
+        archetype = query->matches[iter->archetype_index];
+        chunk = (lt_chunk_t*)iter->chunk_cursor;
+        if (chunk == NULL) {
+            chunk = archetype->chunks;
+        }
+
+        while (chunk != NULL && chunk->count == 0u) {
+            chunk = chunk->next;
+        }
+
+        if (chunk == NULL) {
+            iter->archetype_index += 1u;
+            iter->chunk_cursor = NULL;
+            continue;
+        }
+
+        for (i = 0u; i < query->with_count; ++i) {
+            uint32_t component_index;
+            int found;
+
+            found = lt_archetype_find_component_index(
+                archetype,
+                query->with_terms[i].component_id,
+                &component_index);
+            if (!found) {
+                return LT_STATUS_CONFLICT;
+            }
+
+            query->scratch_columns[i] = lt_chunk_component_ptr(
+                world,
+                archetype,
+                chunk,
+                0u,
+                component_index);
+        }
+
+        out_view->count = chunk->count;
+        out_view->entities = chunk->entities;
+        out_view->columns = query->scratch_columns;
+        out_view->column_count = query->with_count;
+        *out_has_value = 1u;
+
+        iter->columns = query->scratch_columns;
+        iter->column_capacity = query->scratch_capacity;
+        iter->chunk_cursor = chunk->next;
+        if (iter->chunk_cursor == NULL) {
+            iter->archetype_index += 1u;
+        }
+        return LT_STATUS_OK;
+    }
+
     return LT_STATUS_OK;
 }
 
