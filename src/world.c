@@ -95,6 +95,7 @@ struct lt_world_s {
     uint32_t deferred_count;
     uint32_t deferred_capacity;
     uint32_t defer_depth;
+    uint64_t structural_move_count;
 };
 
 struct lt_query_s {
@@ -1204,6 +1205,7 @@ static void lt_archetype_swap_remove_row(
     if (row != last_row) {
         lt_entity_t moved_entity;
 
+        world->structural_move_count += 1u;
         moved_entity = chunk->entities[last_row];
         chunk->entities[row] = moved_entity;
 
@@ -2213,6 +2215,7 @@ lt_status_t lt_add_component(
     slot->archetype = dst_archetype;
     slot->chunk = dst_chunk;
     slot->row = dst_row;
+    world->structural_move_count += 1u;
 
     lt_archetype_swap_remove_row(world, src_archetype, src_chunk, src_row);
     lt_trace_emit(
@@ -2336,6 +2339,7 @@ lt_status_t lt_remove_component(
     slot->archetype = dst_archetype;
     slot->chunk = dst_chunk;
     slot->row = dst_row;
+    world->structural_move_count += 1u;
 
     lt_archetype_swap_remove_row(world, src_archetype, src_chunk, src_row);
     lt_trace_emit(
@@ -2777,5 +2781,6 @@ lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_st
     out_stats->chunk_count = world->total_chunk_count;
     out_stats->pending_commands = world->deferred_count;
     out_stats->defer_depth = world->defer_depth;
+    out_stats->structural_moves = world->structural_move_count;
     return LT_STATUS_OK;
 }

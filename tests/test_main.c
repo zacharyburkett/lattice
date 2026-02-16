@@ -163,6 +163,7 @@ static int test_world_create_destroy_defaults(void)
     ASSERT_TRUE(stats.live_entities == 0u);
     ASSERT_TRUE(stats.registered_components == 0u);
     ASSERT_TRUE(stats.archetype_count >= 1u);
+    ASSERT_TRUE(stats.structural_moves == 0ull);
 
     lt_world_destroy(world);
     return 0;
@@ -395,6 +396,49 @@ static int test_swap_remove_updates_entity_locations(void)
     ASSERT_TRUE(out_b->x == 21.0f);
     ASSERT_TRUE(out_b->y == 22.0f);
     ASSERT_TRUE(out_b->z == 23.0f);
+
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int test_world_stats_structural_moves(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t a;
+    lt_entity_t b;
+    lt_world_stats_t stats;
+    test_vec3_t position;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.structural_moves == 0ull);
+
+    ASSERT_STATUS(lt_entity_create(world, &a), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_create(world, &b), LT_STATUS_OK);
+
+    position.x = 1.0f;
+    position.y = 2.0f;
+    position.z = 3.0f;
+
+    ASSERT_STATUS(lt_add_component(world, a, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.structural_moves == 2ull);
+
+    ASSERT_STATUS(lt_add_component(world, b, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.structural_moves == 3ull);
+
+    ASSERT_STATUS(lt_remove_component(world, a, position_id), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.structural_moves == 5ull);
+
+    ASSERT_STATUS(lt_remove_component(world, b, position_id), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+    ASSERT_TRUE(stats.structural_moves == 6ull);
 
     lt_world_destroy(world);
     return 0;
@@ -909,6 +953,7 @@ int main(void)
     RUN_TEST(test_component_validation);
     RUN_TEST(test_add_remove_components_preserve_data);
     RUN_TEST(test_swap_remove_updates_entity_locations);
+    RUN_TEST(test_world_stats_structural_moves);
     RUN_TEST(test_destructors_called_on_remove_destroy_and_world_destroy);
     RUN_TEST(test_tag_component_behavior);
     RUN_TEST(test_query_iteration_and_filters);

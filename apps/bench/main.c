@@ -179,11 +179,12 @@ static void bench_print_results_text(
     printf("checksum=%.6f\n", results->checksum);
     printf(
         "stats_live=%" PRIu32 " stats_archetypes=%" PRIu32 " stats_chunks=%" PRIu32
-        " stats_pending=%" PRIu32 "\n",
+        " stats_pending=%" PRIu32 " stats_structural_moves=%" PRIu64 "\n",
         stats->live_entities,
         stats->archetype_count,
         stats->chunk_count,
-        stats->pending_commands);
+        stats->pending_commands,
+        stats->structural_moves);
 }
 
 static void bench_print_results_csv(
@@ -193,10 +194,10 @@ static void bench_print_results_csv(
 {
     printf(
         "entities,frames,seed,defer,spawn_ms,simulate_ms,touched_entities,simulate_entities_per_sec,checksum,"
-        "stats_live,stats_archetypes,stats_chunks,stats_pending\n");
+        "stats_live,stats_archetypes,stats_chunks,stats_pending,stats_structural_moves\n");
     printf(
-        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,"
-        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
+        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,%" PRIu32
+        ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu64 "\n",
         opts->entity_count,
         opts->frame_count,
         opts->seed,
@@ -209,7 +210,8 @@ static void bench_print_results_csv(
         stats->live_entities,
         stats->archetype_count,
         stats->chunk_count,
-        stats->pending_commands);
+        stats->pending_commands,
+        stats->structural_moves);
 }
 
 static void bench_print_results_json(
@@ -230,7 +232,8 @@ static void bench_print_results_json(
     printf("  \"stats_live\": %" PRIu32 ",\n", stats->live_entities);
     printf("  \"stats_archetypes\": %" PRIu32 ",\n", stats->archetype_count);
     printf("  \"stats_chunks\": %" PRIu32 ",\n", stats->chunk_count);
-    printf("  \"stats_pending\": %" PRIu32 "\n", stats->pending_commands);
+    printf("  \"stats_pending\": %" PRIu32 ",\n", stats->pending_commands);
+    printf("  \"stats_structural_moves\": %" PRIu64 "\n", stats->structural_moves);
     printf("}\n");
 }
 

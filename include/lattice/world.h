@@ -60,6 +60,7 @@ typedef struct lt_world_stats_s {
     uint32_t chunk_count;
     uint32_t pending_commands;
     uint32_t defer_depth;
+    uint64_t structural_moves;
 } lt_world_stats_t;
 
 typedef enum lt_trace_event_kind_e {
