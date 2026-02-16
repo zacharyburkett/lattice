@@ -2241,7 +2241,7 @@ lt_status_t lt_add_component(
         if (dst_component_id == component_id) {
             lt_component_init_added(component, dst_ptr, initial_value);
         } else {
-            uint32_t src_i;
+            uint32_t src_i = 0u;
             void* src_ptr;
 
             (void)lt_archetype_find_component_index(src_archetype, dst_component_id, &src_i);
@@ -2352,7 +2352,7 @@ lt_status_t lt_remove_component(
     for (i = 0u; i < dst_archetype->component_count; ++i) {
         lt_component_id_t dst_component_id;
         const lt_component_record_t* component;
-        uint32_t src_i;
+        uint32_t src_i = 0u;
         void* src_ptr;
         void* dst_ptr;
 
