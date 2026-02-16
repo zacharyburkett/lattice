@@ -477,6 +477,135 @@ static int run_seeded_determinism_sequence(
     return 0;
 }
 
+typedef struct test_parallel_step_ctx_s {
+    float dt;
+} test_parallel_step_ctx_t;
+
+static void test_parallel_integrate_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    test_parallel_step_ctx_t* step_ctx;
+    test_vec3_t* position_col;
+    test_vec3_t* velocity_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 2u) {
+        return;
+    }
+
+    step_ctx = (test_parallel_step_ctx_t*)user_data;
+    position_col = (test_vec3_t*)view->columns[0];
+    velocity_col = (test_vec3_t*)view->columns[1];
+
+    for (row = 0u; row < view->count; ++row) {
+        position_col[row].x += velocity_col[row].x * step_ctx->dt;
+        position_col[row].y += velocity_col[row].y * step_ctx->dt;
+        position_col[row].z += velocity_col[row].z * step_ctx->dt;
+    }
+}
+
+static int run_parallel_query_simulation(
+    uint32_t seed,
+    uint32_t worker_count,
+    test_determinism_snapshot_t* out_snapshot)
+{
+    enum {
+        ENTITY_COUNT = 256u,
+        FRAME_COUNT = 24u
+    };
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_query_term_t terms[2];
+    lt_query_desc_t query_desc;
+    lt_query_t* query;
+    uint32_t rng;
+    uint32_t i;
+    uint32_t frame;
+    test_parallel_step_ctx_t step_ctx;
+
+    ASSERT_TRUE(out_snapshot != NULL);
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    memset(terms, 0, sizeof(terms));
+    terms[0].component_id = position_id;
+    terms[0].access = LT_ACCESS_WRITE;
+    terms[1].component_id = velocity_id;
+    terms[1].access = LT_ACCESS_READ;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = terms;
+    query_desc.with_count = 2u;
+    ASSERT_STATUS(lt_query_create(world, &query_desc, &query), LT_STATUS_OK);
+
+    rng = seed;
+    for (i = 0u; i < ENTITY_COUNT; ++i) {
+        lt_entity_t entity;
+        test_vec3_t position;
+        test_vec3_t velocity;
+
+        ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+        position.x = test_rand_range(&rng, -100.0f, 100.0f);
+        position.y = test_rand_range(&rng, -100.0f, 100.0f);
+        position.z = test_rand_range(&rng, -100.0f, 100.0f);
+        velocity.x = test_rand_range(&rng, -2.0f, 2.0f);
+        velocity.y = test_rand_range(&rng, -2.0f, 2.0f);
+        velocity.z = test_rand_range(&rng, -2.0f, 2.0f);
+
+        ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+        ASSERT_STATUS(lt_add_component(world, entity, velocity_id, &velocity), LT_STATUS_OK);
+    }
+
+    step_ctx.dt = 1.0f / 60.0f;
+    for (frame = 0u; frame < FRAME_COUNT; ++frame) {
+        ASSERT_STATUS(
+            lt_query_for_each_chunk_parallel(query, worker_count, test_parallel_integrate_chunk, &step_ctx),
+            LT_STATUS_OK);
+    }
+
+    {
+        lt_query_iter_t iter;
+        lt_chunk_view_t view;
+        uint8_t has_value;
+        uint64_t checksum;
+
+        checksum = 0xcbf29ce484222325ull;
+        ASSERT_STATUS(lt_query_iter_begin(query, &iter), LT_STATUS_OK);
+        while (1) {
+            ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+            if (has_value == 0u) {
+                break;
+            }
+
+            for (i = 0u; i < view.count; ++i) {
+                test_vec3_t* position_col;
+
+                position_col = (test_vec3_t*)view.columns[0];
+                checksum = test_checksum_mix(checksum, (uint64_t)(uint32_t)view.entities[i]);
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].x));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].y));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].z));
+            }
+        }
+
+        out_snapshot->checksum = checksum;
+    }
+
+    ASSERT_STATUS(lt_world_get_stats(world, &out_snapshot->stats), LT_STATUS_OK);
+    out_snapshot->tracked_alive_count = out_snapshot->stats.live_entities;
+
+    lt_query_destroy(query);
+    lt_world_destroy(world);
+    return 0;
+}
+
 static int test_world_create_destroy_defaults(void)
 {
     lt_world_t* world;
@@ -1269,6 +1398,82 @@ static int test_trace_hook_reports_query_events(void)
     return 0;
 }
 
+static int test_parallel_query_for_each_chunk_validation(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t entity;
+    test_vec3_t position;
+    test_vec3_t velocity;
+    lt_query_term_t terms[2];
+    lt_query_desc_t query_desc;
+    lt_query_t* query;
+    test_parallel_step_ctx_t step_ctx;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+    ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+    position.x = 0.0f;
+    position.y = 1.0f;
+    position.z = 2.0f;
+    velocity.x = 1.0f;
+    velocity.y = 1.0f;
+    velocity.z = 1.0f;
+    ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, entity, velocity_id, &velocity), LT_STATUS_OK);
+
+    memset(terms, 0, sizeof(terms));
+    terms[0].component_id = position_id;
+    terms[0].access = LT_ACCESS_WRITE;
+    terms[1].component_id = velocity_id;
+    terms[1].access = LT_ACCESS_READ;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = terms;
+    query_desc.with_count = 2u;
+    ASSERT_STATUS(lt_query_create(world, &query_desc, &query), LT_STATUS_OK);
+
+    step_ctx.dt = 1.0f / 60.0f;
+    ASSERT_STATUS(
+        lt_query_for_each_chunk_parallel(query, 0u, test_parallel_integrate_chunk, &step_ctx),
+        LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(
+        lt_query_for_each_chunk_parallel(query, 1u, NULL, &step_ctx),
+        LT_STATUS_INVALID_ARGUMENT);
+
+    ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(
+        lt_query_for_each_chunk_parallel(query, 2u, test_parallel_integrate_chunk, &step_ctx),
+        LT_STATUS_CONFLICT);
+    ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_OK);
+
+    lt_query_destroy(query);
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int test_parallel_query_for_each_chunk_deterministic(void)
+{
+    test_determinism_snapshot_t serial_run;
+    test_determinism_snapshot_t parallel_run_a;
+    test_determinism_snapshot_t parallel_run_b;
+
+    ASSERT_TRUE(run_parallel_query_simulation(0x0BADF00Du, 1u, &serial_run) == 0);
+    ASSERT_TRUE(run_parallel_query_simulation(0x0BADF00Du, 4u, &parallel_run_a) == 0);
+    ASSERT_TRUE(run_parallel_query_simulation(0x0BADF00Du, 4u, &parallel_run_b) == 0);
+
+    ASSERT_TRUE(serial_run.checksum == parallel_run_a.checksum);
+    ASSERT_TRUE(parallel_run_a.checksum == parallel_run_b.checksum);
+    ASSERT_TRUE(serial_run.stats.live_entities == parallel_run_a.stats.live_entities);
+    ASSERT_TRUE(serial_run.stats.chunk_count == parallel_run_a.stats.chunk_count);
+    ASSERT_TRUE(serial_run.stats.structural_moves == parallel_run_a.stats.structural_moves);
+    ASSERT_TRUE(parallel_run_a.stats.structural_moves == parallel_run_b.stats.structural_moves);
+    return 0;
+}
+
 static int test_determinism_seeded_mixed_sequence(void)
 {
     test_determinism_snapshot_t run_a;
@@ -1314,6 +1519,8 @@ int main(void)
     RUN_TEST(test_deferred_command_ordering);
     RUN_TEST(test_trace_hook_reports_core_events);
     RUN_TEST(test_trace_hook_reports_query_events);
+    RUN_TEST(test_parallel_query_for_each_chunk_validation);
+    RUN_TEST(test_parallel_query_for_each_chunk_deterministic);
     RUN_TEST(test_determinism_seeded_mixed_sequence);
     return 0;
 }

@@ -29,6 +29,8 @@ Status: early implementation. Phase 5 diagnostics and benchmark tooling are now 
 - Direct component access APIs (`lt_add_component`, `lt_remove_component`,
   `lt_has_component`, `lt_get_component`).
 - Query API for archetype-matched chunk iteration (`lt_query_*`).
+- Experimental chunk-level parallel query execution helper
+  (`lt_query_for_each_chunk_parallel`).
 - Deferred structural command buffer (`lt_world_begin_defer`,
   `lt_world_end_defer`, `lt_world_flush`).
 - Trace hook diagnostics for runtime event capture (`lt_world_set_trace_hook`),

@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+#include <pthread.h>
+#endif
+
 #ifndef __STDC_VERSION__
 #error "C11 or newer is required"
 #endif
@@ -110,6 +114,24 @@ struct lt_query_s {
     void** scratch_columns;
     uint32_t scratch_capacity;
 };
+
+typedef struct lt_parallel_work_item_s {
+    lt_archetype_t* archetype;
+    lt_chunk_t* chunk;
+} lt_parallel_work_item_t;
+
+typedef struct lt_parallel_worker_ctx_s {
+    lt_world_t* world;
+    lt_query_t* query;
+    const lt_parallel_work_item_t* work_items;
+    uint32_t begin_index;
+    uint32_t end_index;
+    lt_query_parallel_chunk_fn callback;
+    void* user_data;
+    uint32_t worker_index;
+    void** columns;
+    lt_status_t status;
+} lt_parallel_worker_ctx_t;
 
 void lt_query_destroy(lt_query_t* query);
 
@@ -2764,6 +2786,302 @@ lt_status_t lt_query_iter_next(
         LT_COMPONENT_INVALID,
         query->match_count);
     return LT_STATUS_OK;
+}
+
+static lt_status_t lt_query_collect_parallel_work_items(
+    lt_query_t* query,
+    lt_parallel_work_item_t** out_items,
+    uint32_t* out_count)
+{
+    lt_parallel_work_item_t* items;
+    uint32_t item_count;
+    uint32_t match_index;
+    uint32_t write_index;
+    lt_status_t status;
+
+    if (query == NULL || query->world == NULL || out_items == NULL || out_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_items = NULL;
+    *out_count = 0u;
+
+    status = lt_query_refresh(query);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    item_count = 0u;
+    for (match_index = 0u; match_index < query->match_count; ++match_index) {
+        lt_chunk_t* chunk;
+
+        chunk = query->matches[match_index]->chunks;
+        while (chunk != NULL) {
+            if (chunk->count > 0u) {
+                if (item_count == UINT32_MAX) {
+                    return LT_STATUS_CAPACITY_REACHED;
+                }
+                item_count += 1u;
+            }
+            chunk = chunk->next;
+        }
+    }
+
+    if (item_count == 0u) {
+        return LT_STATUS_OK;
+    }
+
+    if (sizeof(*items) > SIZE_MAX / (size_t)item_count) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    items = (lt_parallel_work_item_t*)malloc(sizeof(*items) * (size_t)item_count);
+    if (items == NULL) {
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+
+    write_index = 0u;
+    for (match_index = 0u; match_index < query->match_count; ++match_index) {
+        lt_archetype_t* archetype;
+        lt_chunk_t* chunk;
+
+        archetype = query->matches[match_index];
+        chunk = archetype->chunks;
+        while (chunk != NULL) {
+            if (chunk->count > 0u) {
+                items[write_index].archetype = archetype;
+                items[write_index].chunk = chunk;
+                write_index += 1u;
+            }
+            chunk = chunk->next;
+        }
+    }
+
+    *out_items = items;
+    *out_count = item_count;
+    return LT_STATUS_OK;
+}
+
+static lt_status_t lt_query_execute_parallel_range(lt_parallel_worker_ctx_t* ctx)
+{
+    uint32_t item_index;
+
+    if (ctx == NULL || ctx->world == NULL || ctx->query == NULL || ctx->callback == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (ctx->query->with_count > 0u && ctx->columns == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    for (item_index = ctx->begin_index; item_index < ctx->end_index; ++item_index) {
+        const lt_parallel_work_item_t* item;
+        lt_chunk_view_t view;
+        uint32_t i;
+
+        item = &ctx->work_items[item_index];
+        for (i = 0u; i < ctx->query->with_count; ++i) {
+            uint32_t component_index;
+            int found;
+
+            found = lt_archetype_find_component_index(
+                item->archetype,
+                ctx->query->with_terms[i].component_id,
+                &component_index);
+            if (!found) {
+                return LT_STATUS_CONFLICT;
+            }
+
+            ctx->columns[i] = lt_chunk_component_ptr(
+                ctx->world,
+                item->archetype,
+                item->chunk,
+                0u,
+                component_index);
+        }
+
+        view.count = item->chunk->count;
+        view.entities = item->chunk->entities;
+        view.columns = ctx->columns;
+        view.column_count = ctx->query->with_count;
+        ctx->callback(&view, ctx->worker_index, ctx->user_data);
+    }
+
+    return LT_STATUS_OK;
+}
+
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+static void* lt_query_parallel_worker_entry(void* user_data)
+{
+    lt_parallel_worker_ctx_t* ctx;
+
+    ctx = (lt_parallel_worker_ctx_t*)user_data;
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    ctx->status = lt_query_execute_parallel_range(ctx);
+    return NULL;
+}
+#endif
+
+lt_status_t lt_query_for_each_chunk_parallel(
+    lt_query_t* query,
+    uint32_t worker_count,
+    lt_query_parallel_chunk_fn callback,
+    void* user_data)
+{
+    lt_world_t* world;
+    lt_parallel_work_item_t* work_items;
+    uint32_t work_count;
+    lt_parallel_worker_ctx_t* contexts;
+    lt_status_t status;
+    uint32_t effective_workers;
+    uint32_t base_items;
+    uint32_t extra_items;
+    uint32_t begin_index;
+    uint32_t worker_index;
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+    uint32_t started_threads;
+    pthread_t* threads;
+#endif
+
+    if (query == NULL || query->world == NULL || callback == NULL || worker_count == 0u) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    world = query->world;
+    if (worker_count > 1u && world->defer_depth > 0u) {
+        return LT_STATUS_CONFLICT;
+    }
+
+    status = lt_query_collect_parallel_work_items(query, &work_items, &work_count);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    if (work_count == 0u) {
+        free(work_items);
+        return LT_STATUS_OK;
+    }
+
+    effective_workers = worker_count;
+    if (effective_workers > work_count) {
+        effective_workers = work_count;
+    }
+
+#if !(defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS)
+    effective_workers = 1u;
+#endif
+
+    if (sizeof(*contexts) > SIZE_MAX / (size_t)effective_workers) {
+        free(work_items);
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    contexts = (lt_parallel_worker_ctx_t*)malloc(sizeof(*contexts) * (size_t)effective_workers);
+    if (contexts == NULL) {
+        free(work_items);
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+    memset(contexts, 0, sizeof(*contexts) * (size_t)effective_workers);
+
+    status = LT_STATUS_OK;
+    base_items = work_count / effective_workers;
+    extra_items = work_count % effective_workers;
+    begin_index = 0u;
+    for (worker_index = 0u; worker_index < effective_workers; ++worker_index) {
+        uint32_t item_count;
+
+        item_count = base_items + (worker_index < extra_items ? 1u : 0u);
+        contexts[worker_index].world = world;
+        contexts[worker_index].query = query;
+        contexts[worker_index].work_items = work_items;
+        contexts[worker_index].begin_index = begin_index;
+        contexts[worker_index].end_index = begin_index + item_count;
+        contexts[worker_index].callback = callback;
+        contexts[worker_index].user_data = user_data;
+        contexts[worker_index].worker_index = worker_index;
+        contexts[worker_index].status = LT_STATUS_OK;
+        begin_index += item_count;
+
+        if (query->with_count > 0u) {
+            if (sizeof(*contexts[worker_index].columns) > SIZE_MAX / (size_t)query->with_count) {
+                status = LT_STATUS_CAPACITY_REACHED;
+                break;
+            }
+
+            contexts[worker_index].columns =
+                (void**)malloc(sizeof(*contexts[worker_index].columns) * (size_t)query->with_count);
+            if (contexts[worker_index].columns == NULL) {
+                status = LT_STATUS_ALLOCATION_FAILED;
+                break;
+            }
+        }
+    }
+
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+    threads = NULL;
+    started_threads = 0u;
+#endif
+    if (status == LT_STATUS_OK && effective_workers > 1u) {
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+        if (sizeof(*threads) > SIZE_MAX / (size_t)(effective_workers - 1u)) {
+            status = LT_STATUS_CAPACITY_REACHED;
+        } else {
+            threads = (pthread_t*)malloc(sizeof(*threads) * (size_t)(effective_workers - 1u));
+            if (threads == NULL) {
+                status = LT_STATUS_ALLOCATION_FAILED;
+            }
+        }
+
+        if (status == LT_STATUS_OK) {
+            for (worker_index = 1u; worker_index < effective_workers; ++worker_index) {
+                int rc;
+
+                rc = pthread_create(
+                    &threads[worker_index - 1u],
+                    NULL,
+                    lt_query_parallel_worker_entry,
+                    &contexts[worker_index]);
+                if (rc != 0) {
+                    status = LT_STATUS_ALLOCATION_FAILED;
+                    break;
+                }
+                started_threads += 1u;
+            }
+        }
+
+        if (status == LT_STATUS_OK) {
+            contexts[0].status = lt_query_execute_parallel_range(&contexts[0]);
+        }
+
+        for (worker_index = 0u; worker_index < started_threads; ++worker_index) {
+            (void)pthread_join(threads[worker_index], NULL);
+        }
+#endif
+    } else if (status == LT_STATUS_OK) {
+        contexts[0].status = lt_query_execute_parallel_range(&contexts[0]);
+    }
+
+    if (status == LT_STATUS_OK) {
+        for (worker_index = 0u; worker_index < effective_workers; ++worker_index) {
+            if (contexts[worker_index].status != LT_STATUS_OK) {
+                status = contexts[worker_index].status;
+                break;
+            }
+        }
+    }
+
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+    free(threads);
+#endif
+    for (worker_index = 0u; worker_index < effective_workers; ++worker_index) {
+        free(contexts[worker_index].columns);
+    }
+    free(contexts);
+    free(work_items);
+    return status;
 }
 
 lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_stats)

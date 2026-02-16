@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(lattice VERSION 0.1.0 LANGUAGES C)
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 option(LATTICE_BUILD_TESTS "Build lattice tests" ON)
 option(LATTICE_BUILD_BENCHMARKS "Build lattice benchmark app" ON)
@@ -17,6 +18,11 @@ target_include_directories(lattice
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+target_link_libraries(lattice PRIVATE Threads::Threads)
+
+if(CMAKE_USE_PTHREADS_INIT)
+    target_compile_definitions(lattice PRIVATE LT_HAS_PTHREADS=1)
+endif()
 
 if(MSVC)
     target_compile_options(lattice PRIVATE /W4 /WX)

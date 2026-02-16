@@ -116,6 +116,11 @@ typedef struct lt_chunk_view_s {
     uint32_t column_count;
 } lt_chunk_view_t;
 
+typedef void (*lt_query_parallel_chunk_fn)(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data);
+
 typedef struct lt_query_iter_s {
     lt_query_t* query;
     uint32_t archetype_index;
@@ -177,6 +182,11 @@ lt_status_t lt_query_iter_next(
     lt_query_iter_t* iter,
     lt_chunk_view_t* out_view,
     uint8_t* out_has_value);
+lt_status_t lt_query_for_each_chunk_parallel(
+    lt_query_t* query,
+    uint32_t worker_count,
+    lt_query_parallel_chunk_fn callback,
+    void* user_data);
 
 #ifdef __cplusplus
 }
