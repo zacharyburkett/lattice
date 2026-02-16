@@ -697,6 +697,7 @@ static int run_parallel_query_simulation(
 static int run_schedule_simulation(
     uint32_t seed,
     uint32_t worker_count,
+    uint8_t use_compiled_schedule,
     test_determinism_snapshot_t* out_snapshot,
     lt_query_schedule_stats_t* out_schedule_stats)
 {
@@ -721,6 +722,7 @@ static int run_schedule_simulation(
     lt_query_t* health_query;
     lt_query_t* damp_query;
     lt_query_t* sum_query;
+    lt_schedule_t* schedule;
     lt_query_schedule_entry_t entries[3];
     test_schedule_motion_ctx_t motion_ctx;
     test_schedule_health_ctx_t health_ctx;
@@ -769,6 +771,7 @@ static int run_schedule_simulation(
     damp_desc.with_terms = damp_terms;
     damp_desc.with_count = 1u;
     ASSERT_STATUS(lt_query_create(world, &damp_desc, &damp_query), LT_STATUS_OK);
+    schedule = NULL;
 
     entries[0].query = motion_query;
     entries[0].callback = test_schedule_motion_chunk;
@@ -779,6 +782,10 @@ static int run_schedule_simulation(
     entries[2].query = damp_query;
     entries[2].callback = test_schedule_damp_chunk;
     entries[2].user_data = &damp_ctx;
+
+    if (use_compiled_schedule != 0u) {
+        ASSERT_STATUS(lt_schedule_create(entries, 3u, &schedule), LT_STATUS_OK);
+    }
 
     motion_ctx.dt = 1.0f / 60.0f;
     health_ctx.drain = 0.05f;
@@ -808,9 +815,13 @@ static int run_schedule_simulation(
     for (frame = 0u; frame < FRAME_COUNT; ++frame) {
         lt_query_schedule_stats_t frame_stats;
 
-        ASSERT_STATUS(
-            lt_query_schedule_execute(entries, 3u, worker_count, &frame_stats),
-            LT_STATUS_OK);
+        if (use_compiled_schedule != 0u) {
+            ASSERT_STATUS(lt_schedule_execute(schedule, worker_count, &frame_stats), LT_STATUS_OK);
+        } else {
+            ASSERT_STATUS(
+                lt_query_schedule_execute(entries, 3u, worker_count, &frame_stats),
+                LT_STATUS_OK);
+        }
         if (frame == 0u && out_schedule_stats != NULL) {
             *out_schedule_stats = frame_stats;
         }
@@ -867,6 +878,7 @@ static int run_schedule_simulation(
     ASSERT_STATUS(lt_world_get_stats(world, &out_snapshot->stats), LT_STATUS_OK);
     out_snapshot->tracked_alive_count = out_snapshot->stats.live_entities;
 
+    lt_schedule_destroy(schedule);
     lt_query_destroy(sum_query);
     lt_query_destroy(damp_query);
     lt_query_destroy(health_query);
@@ -1755,6 +1767,8 @@ static int test_query_schedule_validation(void)
     lt_query_desc_t desc;
     lt_query_t* query_a;
     lt_query_t* query_b;
+    lt_schedule_t* schedule;
+    lt_schedule_t* invalid_schedule;
     lt_query_schedule_entry_t entry_a;
     lt_query_schedule_entry_t mixed_entries[2];
 
@@ -1777,10 +1791,16 @@ static int test_query_schedule_validation(void)
     desc.with_terms = &term;
     desc.with_count = 1u;
     ASSERT_STATUS(lt_query_create(world_b, &desc, &query_b), LT_STATUS_OK);
+    schedule = NULL;
+    invalid_schedule = NULL;
 
     entry_a.query = query_a;
     entry_a.callback = test_parallel_integrate_chunk;
     entry_a.user_data = NULL;
+
+    ASSERT_STATUS(lt_schedule_create(NULL, 0u, &schedule), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_schedule_create(&entry_a, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_schedule_execute(NULL, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
 
     ASSERT_STATUS(lt_query_schedule_execute(NULL, 0u, 1u, NULL), LT_STATUS_OK);
     ASSERT_STATUS(lt_query_schedule_execute(NULL, 1u, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
@@ -1788,7 +1808,12 @@ static int test_query_schedule_validation(void)
 
     entry_a.callback = NULL;
     ASSERT_STATUS(lt_query_schedule_execute(&entry_a, 1u, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_schedule_create(&entry_a, 1u, &schedule), LT_STATUS_INVALID_ARGUMENT);
     entry_a.callback = test_parallel_integrate_chunk;
+    ASSERT_STATUS(lt_schedule_create(&entry_a, 1u, &schedule), LT_STATUS_OK);
+    ASSERT_TRUE(schedule != NULL);
+    ASSERT_STATUS(lt_schedule_execute(schedule, 0u, NULL), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_schedule_execute(schedule, 1u, NULL), LT_STATUS_OK);
 
     mixed_entries[0].query = query_a;
     mixed_entries[0].callback = test_parallel_integrate_chunk;
@@ -1797,12 +1822,16 @@ static int test_query_schedule_validation(void)
     mixed_entries[1].callback = test_parallel_integrate_chunk;
     mixed_entries[1].user_data = NULL;
     ASSERT_STATUS(lt_query_schedule_execute(mixed_entries, 2u, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_schedule_create(mixed_entries, 2u, &invalid_schedule), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(invalid_schedule == NULL);
 
     ASSERT_STATUS(lt_world_begin_defer(world_a), LT_STATUS_OK);
+    ASSERT_STATUS(lt_schedule_execute(schedule, 2u, NULL), LT_STATUS_CONFLICT);
     ASSERT_STATUS(lt_query_schedule_execute(&mixed_entries[0], 1u, 2u, NULL), LT_STATUS_CONFLICT);
     ASSERT_STATUS(lt_world_end_defer(world_a), LT_STATUS_OK);
     ASSERT_STATUS(lt_world_flush(world_a), LT_STATUS_OK);
 
+    lt_schedule_destroy(schedule);
     lt_query_destroy(query_b);
     lt_query_destroy(query_a);
     lt_world_destroy(world_b);
@@ -1815,12 +1844,22 @@ static int test_query_schedule_batches_and_deterministic(void)
     test_determinism_snapshot_t serial_run;
     test_determinism_snapshot_t parallel_run_a;
     test_determinism_snapshot_t parallel_run_b;
+    test_determinism_snapshot_t one_shot_parallel_run;
     lt_query_schedule_stats_t serial_stats;
     lt_query_schedule_stats_t parallel_stats;
+    lt_query_schedule_stats_t one_shot_parallel_stats;
 
-    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 1u, &serial_run, &serial_stats) == 0);
-    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 4u, &parallel_run_a, &parallel_stats) == 0);
-    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 4u, &parallel_run_b, NULL) == 0);
+    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 1u, 1u, &serial_run, &serial_stats) == 0);
+    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 4u, 1u, &parallel_run_a, &parallel_stats) == 0);
+    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 4u, 1u, &parallel_run_b, NULL) == 0);
+    ASSERT_TRUE(
+        run_schedule_simulation(
+            0x00A11CEAu,
+            4u,
+            0u,
+            &one_shot_parallel_run,
+            &one_shot_parallel_stats)
+        == 0);
 
     ASSERT_TRUE(parallel_stats.batch_count == 2u);
     ASSERT_TRUE(parallel_stats.edge_count == 1u);
@@ -1828,13 +1867,18 @@ static int test_query_schedule_batches_and_deterministic(void)
     ASSERT_TRUE(serial_stats.batch_count == parallel_stats.batch_count);
     ASSERT_TRUE(serial_stats.edge_count == parallel_stats.edge_count);
     ASSERT_TRUE(serial_stats.max_batch_size == parallel_stats.max_batch_size);
+    ASSERT_TRUE(one_shot_parallel_stats.batch_count == parallel_stats.batch_count);
+    ASSERT_TRUE(one_shot_parallel_stats.edge_count == parallel_stats.edge_count);
+    ASSERT_TRUE(one_shot_parallel_stats.max_batch_size == parallel_stats.max_batch_size);
 
     ASSERT_TRUE(serial_run.checksum == parallel_run_a.checksum);
     ASSERT_TRUE(parallel_run_a.checksum == parallel_run_b.checksum);
+    ASSERT_TRUE(one_shot_parallel_run.checksum == parallel_run_a.checksum);
     ASSERT_TRUE(serial_run.stats.live_entities == parallel_run_a.stats.live_entities);
     ASSERT_TRUE(serial_run.stats.chunk_count == parallel_run_a.stats.chunk_count);
     ASSERT_TRUE(serial_run.stats.structural_moves == parallel_run_a.stats.structural_moves);
     ASSERT_TRUE(parallel_run_a.stats.structural_moves == parallel_run_b.stats.structural_moves);
+    ASSERT_TRUE(one_shot_parallel_run.stats.structural_moves == parallel_run_a.stats.structural_moves);
     return 0;
 }
 

@@ -115,6 +115,17 @@ struct lt_query_s {
     uint32_t scratch_capacity;
 };
 
+struct lt_schedule_s {
+    lt_world_t* world;
+    lt_query_schedule_entry_t* entries;
+    uint32_t entry_count;
+    uint32_t* batch_nodes;
+    uint32_t* batch_offsets;
+    uint32_t batch_count;
+    uint32_t edge_count;
+    uint32_t max_batch_size;
+};
+
 typedef struct lt_parallel_work_item_s {
     lt_archetype_t* archetype;
     lt_chunk_t* chunk;
@@ -3291,34 +3302,23 @@ static lt_status_t lt_query_schedule_execute_stage(
 #endif
 }
 
-lt_status_t lt_query_schedule_execute(
+static lt_status_t lt_query_schedule_validate_entries(
     const lt_query_schedule_entry_t* entries,
     uint32_t entry_count,
-    uint32_t worker_count,
-    lt_query_schedule_stats_t* out_stats)
+    lt_world_t** out_world)
 {
     lt_world_t* world;
-    uint8_t* active;
-    uint8_t* edges;
-    uint32_t* indegree;
-    uint32_t* stage_nodes;
     uint32_t i;
-    uint32_t remaining_count;
-    uint32_t batch_count;
-    uint32_t edge_count;
-    uint32_t max_batch_size;
-    size_t edge_matrix_count;
-    lt_status_t status;
 
-    if (out_stats != NULL) {
-        memset(out_stats, 0, sizeof(*out_stats));
+    if (out_world != NULL) {
+        *out_world = NULL;
     }
 
     if (entry_count == 0u) {
         return LT_STATUS_OK;
     }
 
-    if (entries == NULL || worker_count == 0u) {
+    if (entries == NULL) {
         return LT_STATUS_INVALID_ARGUMENT;
     }
 
@@ -3327,14 +3327,53 @@ lt_status_t lt_query_schedule_execute(
     }
     world = entries[0].query->world;
 
-    if (worker_count > 1u && world->defer_depth > 0u) {
-        return LT_STATUS_CONFLICT;
-    }
-
     for (i = 0u; i < entry_count; ++i) {
         if (entries[i].query == NULL || entries[i].query->world != world || entries[i].callback == NULL) {
             return LT_STATUS_INVALID_ARGUMENT;
         }
+    }
+
+    if (out_world != NULL) {
+        *out_world = world;
+    }
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_schedule_create(
+    const lt_query_schedule_entry_t* entries,
+    uint32_t entry_count,
+    lt_schedule_t** out_schedule)
+{
+    lt_world_t* world;
+    uint8_t* active;
+    uint8_t* edges;
+    uint32_t* indegree;
+    uint32_t* stage_nodes;
+    uint32_t* batch_nodes;
+    uint32_t* batch_offsets;
+    lt_schedule_t* schedule;
+    uint32_t i;
+    uint32_t remaining_count;
+    uint32_t batch_count;
+    uint32_t edge_count;
+    uint32_t max_batch_size;
+    uint32_t batch_node_write;
+    size_t edge_matrix_count;
+    size_t entry_plus_one;
+    lt_status_t status;
+
+    if (out_schedule == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    *out_schedule = NULL;
+
+    if (entries == NULL || entry_count == 0u) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    status = lt_query_schedule_validate_entries(entries, entry_count, &world);
+    if (status != LT_STATUS_OK) {
+        return status;
     }
 
     edge_matrix_count = (size_t)entry_count;
@@ -3343,23 +3382,36 @@ lt_status_t lt_query_schedule_execute(
     }
     edge_matrix_count *= (size_t)entry_count;
 
+    entry_plus_one = (size_t)entry_count + 1u;
+    if (entry_plus_one <= (size_t)entry_count) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
     if (sizeof(*active) > SIZE_MAX / (size_t)entry_count
         || sizeof(*indegree) > SIZE_MAX / (size_t)entry_count
         || sizeof(*stage_nodes) > SIZE_MAX / (size_t)entry_count
-        || sizeof(*edges) > SIZE_MAX / edge_matrix_count) {
+        || sizeof(*batch_nodes) > SIZE_MAX / (size_t)entry_count
+        || sizeof(*batch_offsets) > SIZE_MAX / entry_plus_one
+        || sizeof(*edges) > SIZE_MAX / edge_matrix_count
+        || sizeof(*schedule->entries) > SIZE_MAX / (size_t)entry_count) {
         return LT_STATUS_CAPACITY_REACHED;
     }
 
     active = (uint8_t*)malloc(sizeof(*active) * (size_t)entry_count);
     indegree = (uint32_t*)malloc(sizeof(*indegree) * (size_t)entry_count);
     stage_nodes = (uint32_t*)malloc(sizeof(*stage_nodes) * (size_t)entry_count);
+    batch_nodes = (uint32_t*)malloc(sizeof(*batch_nodes) * (size_t)entry_count);
+    batch_offsets = (uint32_t*)malloc(sizeof(*batch_offsets) * entry_plus_one);
     edges = (uint8_t*)malloc(sizeof(*edges) * edge_matrix_count);
-    if (active == NULL || indegree == NULL || stage_nodes == NULL || edges == NULL) {
-        free(edges);
-        free(stage_nodes);
-        free(indegree);
-        free(active);
-        return LT_STATUS_ALLOCATION_FAILED;
+    schedule = NULL;
+    if (active == NULL
+        || indegree == NULL
+        || stage_nodes == NULL
+        || batch_nodes == NULL
+        || batch_offsets == NULL
+        || edges == NULL) {
+        status = LT_STATUS_ALLOCATION_FAILED;
+        goto cleanup;
     }
 
     memset(active, 1, sizeof(*active) * (size_t)entry_count);
@@ -3382,7 +3434,8 @@ lt_status_t lt_query_schedule_execute(
     remaining_count = entry_count;
     batch_count = 0u;
     max_batch_size = 0u;
-    status = LT_STATUS_OK;
+    batch_node_write = 0u;
+    batch_offsets[0] = 0u;
 
     while (remaining_count > 0u) {
         uint32_t stage_count;
@@ -3397,17 +3450,11 @@ lt_status_t lt_query_schedule_execute(
 
         if (stage_count == 0u) {
             status = LT_STATUS_CONFLICT;
-            break;
+            goto cleanup;
         }
 
         if (stage_count > max_batch_size) {
             max_batch_size = stage_count;
-        }
-        batch_count += 1u;
-
-        status = lt_query_schedule_execute_stage(entries, stage_nodes, stage_count, worker_count);
-        if (status != LT_STATUS_OK) {
-            break;
         }
 
         for (i = 0u; i < stage_count; ++i) {
@@ -3415,6 +3462,9 @@ lt_status_t lt_query_schedule_execute(
             uint32_t j;
 
             node_index = stage_nodes[i];
+            batch_nodes[batch_node_write] = node_index;
+            batch_node_write += 1u;
+
             active[node_index] = 0u;
             remaining_count -= 1u;
 
@@ -3431,18 +3481,150 @@ lt_status_t lt_query_schedule_execute(
                 edges[edge_index] = 0u;
             }
         }
+
+        batch_count += 1u;
+        batch_offsets[batch_count] = batch_node_write;
     }
 
-    if (out_stats != NULL) {
-        out_stats->batch_count = batch_count;
-        out_stats->edge_count = edge_count;
-        out_stats->max_batch_size = max_batch_size;
+    schedule = (lt_schedule_t*)malloc(sizeof(*schedule));
+    if (schedule == NULL) {
+        status = LT_STATUS_ALLOCATION_FAILED;
+        goto cleanup;
     }
+    memset(schedule, 0, sizeof(*schedule));
 
+    schedule->entries =
+        (lt_query_schedule_entry_t*)malloc(sizeof(*schedule->entries) * (size_t)entry_count);
+    if (schedule->entries == NULL) {
+        status = LT_STATUS_ALLOCATION_FAILED;
+        goto cleanup;
+    }
+    memcpy(schedule->entries, entries, sizeof(*schedule->entries) * (size_t)entry_count);
+
+    schedule->world = world;
+    schedule->entry_count = entry_count;
+    schedule->batch_nodes = batch_nodes;
+    schedule->batch_offsets = batch_offsets;
+    schedule->batch_count = batch_count;
+    schedule->edge_count = edge_count;
+    schedule->max_batch_size = max_batch_size;
+
+    batch_nodes = NULL;
+    batch_offsets = NULL;
+    *out_schedule = schedule;
+    status = LT_STATUS_OK;
+
+cleanup:
     free(edges);
     free(stage_nodes);
     free(indegree);
     free(active);
+    free(batch_offsets);
+    free(batch_nodes);
+    if (status != LT_STATUS_OK) {
+        if (schedule != NULL) {
+            free(schedule->entries);
+            free(schedule);
+        }
+    }
+    return status;
+}
+
+void lt_schedule_destroy(lt_schedule_t* schedule)
+{
+    if (schedule == NULL) {
+        return;
+    }
+
+    free(schedule->batch_offsets);
+    free(schedule->batch_nodes);
+    free(schedule->entries);
+    free(schedule);
+}
+
+lt_status_t lt_schedule_execute(
+    lt_schedule_t* schedule,
+    uint32_t worker_count,
+    lt_query_schedule_stats_t* out_stats)
+{
+    uint32_t batch_index;
+
+    if (out_stats != NULL) {
+        memset(out_stats, 0, sizeof(*out_stats));
+    }
+
+    if (schedule == NULL || worker_count == 0u || schedule->world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (worker_count > 1u && schedule->world->defer_depth > 0u) {
+        return LT_STATUS_CONFLICT;
+    }
+
+    if (out_stats != NULL) {
+        out_stats->batch_count = schedule->batch_count;
+        out_stats->edge_count = schedule->edge_count;
+        out_stats->max_batch_size = schedule->max_batch_size;
+    }
+
+    for (batch_index = 0u; batch_index < schedule->batch_count; ++batch_index) {
+        uint32_t offset;
+        uint32_t count;
+        lt_status_t status;
+
+        offset = schedule->batch_offsets[batch_index];
+        count = schedule->batch_offsets[batch_index + 1u] - offset;
+        status = lt_query_schedule_execute_stage(
+            schedule->entries,
+            &schedule->batch_nodes[offset],
+            count,
+            worker_count);
+        if (status != LT_STATUS_OK) {
+            return status;
+        }
+    }
+
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_query_schedule_execute(
+    const lt_query_schedule_entry_t* entries,
+    uint32_t entry_count,
+    uint32_t worker_count,
+    lt_query_schedule_stats_t* out_stats)
+{
+    lt_world_t* world;
+    lt_schedule_t* schedule;
+    lt_status_t status;
+
+    if (out_stats != NULL) {
+        memset(out_stats, 0, sizeof(*out_stats));
+    }
+
+    if (entry_count == 0u) {
+        return LT_STATUS_OK;
+    }
+
+    if (entries == NULL || worker_count == 0u) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    status = lt_query_schedule_validate_entries(entries, entry_count, &world);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    if (worker_count > 1u && world->defer_depth > 0u) {
+        return LT_STATUS_CONFLICT;
+    }
+
+    status = lt_schedule_create(entries, entry_count, &schedule);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_schedule_execute(schedule, worker_count, out_stats);
+    lt_schedule_destroy(schedule);
     return status;
 }
 

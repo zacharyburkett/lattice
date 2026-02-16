@@ -559,6 +559,7 @@ static int bench_run_scheduler_case(
     lt_query_t* health_query;
     lt_query_t* damp_query;
     lt_query_t* churn_query;
+    lt_schedule_t* schedule;
     lt_query_schedule_entry_t entries[4];
     bench_motion_ctx_t motion_ctx;
     bench_health_ctx_t health_ctx;
@@ -600,6 +601,7 @@ static int bench_run_scheduler_case(
     health_query = NULL;
     damp_query = NULL;
     churn_query = NULL;
+    schedule = NULL;
     tracked_entities = NULL;
     has_churn = NULL;
     toggle_count_per_frame = 0u;
@@ -766,12 +768,13 @@ static int bench_run_scheduler_case(
         schedule_entry_count = 4u;
     }
 
+    BENCH_CASE_REQUIRE_STATUS(lt_schedule_create(entries, schedule_entry_count, &schedule));
+
     sim_start_ns = bench_now_ns();
     for (frame = 0u; frame < opts->frame_count; ++frame) {
         lt_query_schedule_stats_t frame_stats;
 
-        BENCH_CASE_REQUIRE_STATUS(
-            lt_query_schedule_execute(entries, schedule_entry_count, workers, &frame_stats));
+        BENCH_CASE_REQUIRE_STATUS(lt_schedule_execute(schedule, workers, &frame_stats));
         if (frame == 0u) {
             out_case->schedule_stats = frame_stats;
         }
@@ -834,6 +837,7 @@ static int bench_run_scheduler_case(
                                               ? 0.0
                                               : ((double)out_case->touched_entities / sim_seconds);
 
+    lt_schedule_destroy(schedule);
     lt_query_destroy(churn_query);
     lt_query_destroy(damp_query);
     lt_query_destroy(health_query);
@@ -845,6 +849,7 @@ static int bench_run_scheduler_case(
     return 0;
 
 cleanup:
+    lt_schedule_destroy(schedule);
     lt_query_destroy(churn_query);
     lt_query_destroy(damp_query);
     lt_query_destroy(health_query);

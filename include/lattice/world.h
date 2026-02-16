@@ -12,6 +12,7 @@ extern "C" {
 
 typedef struct lt_world_s lt_world_t;
 typedef struct lt_query_s lt_query_t;
+typedef struct lt_schedule_s lt_schedule_t;
 
 typedef void* (*lt_alloc_fn)(void* user, size_t size, size_t align);
 typedef void (*lt_free_fn)(void* user, void* ptr, size_t size, size_t align);
@@ -199,6 +200,15 @@ lt_status_t lt_query_for_each_chunk_parallel(
     uint32_t worker_count,
     lt_query_parallel_chunk_fn callback,
     void* user_data);
+lt_status_t lt_schedule_create(
+    const lt_query_schedule_entry_t* entries,
+    uint32_t entry_count,
+    lt_schedule_t** out_schedule);
+void lt_schedule_destroy(lt_schedule_t* schedule);
+lt_status_t lt_schedule_execute(
+    lt_schedule_t* schedule,
+    uint32_t worker_count,
+    lt_query_schedule_stats_t* out_stats);
 lt_status_t lt_query_schedule_execute(
     const lt_query_schedule_entry_t* entries,
     uint32_t entry_count,
