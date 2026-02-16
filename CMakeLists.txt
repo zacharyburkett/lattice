@@ -87,5 +87,15 @@ if(LATTICE_BUILD_BENCHMARKS)
                 -DEXPECTED_WORKERS=1,3,6
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
         )
+        add_test(
+            NAME lattice_bench_smoke_churn
+            COMMAND ${CMAKE_COMMAND}
+                -DBENCH_EXE=$<TARGET_FILE:lattice_bench>
+                -DMODE=text
+                -DSCENE=churn
+                -DWORKERS=1,2
+                -DEXPECTED_WORKERS=1,2
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
+        )
     endif()
 endif()

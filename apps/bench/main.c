@@ -16,11 +16,20 @@ typedef struct bench_health_s {
     float value;
 } bench_health_t;
 
+typedef struct bench_churn_s {
+    float resistance;
+} bench_churn_t;
+
 typedef enum bench_output_format_e {
     BENCH_OUTPUT_TEXT = 0,
     BENCH_OUTPUT_CSV = 1,
     BENCH_OUTPUT_JSON = 2
 } bench_output_format_t;
+
+typedef enum bench_scene_e {
+    BENCH_SCENE_STEADY = 0,
+    BENCH_SCENE_CHURN = 1
+} bench_scene_t;
 
 enum {
     BENCH_SWEEP_WORKER_COUNT_DEFAULT = 4,
@@ -33,6 +42,7 @@ typedef struct bench_options_s {
     uint32_t seed;
     uint8_t use_defer;
     bench_output_format_t output_format;
+    bench_scene_t scene;
     uint32_t worker_count;
     uint32_t workers[BENCH_SWEEP_WORKER_COUNT_MAX];
 } bench_options_t;
@@ -45,6 +55,7 @@ typedef struct bench_scheduler_case_s {
     uint64_t touched_entities;
     double checksum;
     double speedup_vs_serial;
+    uint64_t structural_ops;
     lt_world_stats_t stats;
     lt_query_schedule_stats_t schedule_stats;
 } bench_scheduler_case_t;
@@ -71,6 +82,11 @@ typedef struct bench_damp_ctx_s {
     float factor;
 } bench_damp_ctx_t;
 
+typedef struct bench_churn_ctx_s {
+    float blend;
+    float drift;
+} bench_churn_ctx_t;
+
 static uint64_t bench_now_ns(void)
 {
     struct timespec ts;
@@ -87,7 +103,7 @@ static void bench_print_usage(const char* program)
     fprintf(
         stderr,
         "Usage: %s [--entities N] [--frames N] [--seed N] [--defer 0|1] "
-        "[--format text|csv|json] [--workers N[,N...]]\n",
+        "[--format text|csv|json] [--scene steady|churn] [--workers N[,N...]]\n",
         program);
 }
 
@@ -125,6 +141,24 @@ static int bench_parse_output_format(const char* arg, bench_output_format_t* out
     }
     if (strcmp(arg, "json") == 0) {
         *out_format = BENCH_OUTPUT_JSON;
+        return 0;
+    }
+
+    return 1;
+}
+
+static int bench_parse_scene(const char* arg, bench_scene_t* out_scene)
+{
+    if (arg == NULL || out_scene == NULL) {
+        return 1;
+    }
+
+    if (strcmp(arg, "steady") == 0) {
+        *out_scene = BENCH_SCENE_STEADY;
+        return 0;
+    }
+    if (strcmp(arg, "churn") == 0) {
+        *out_scene = BENCH_SCENE_CHURN;
         return 0;
     }
 
@@ -195,6 +229,7 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
     out_opts->seed = 1337u;
     out_opts->use_defer = 1u;
     out_opts->output_format = BENCH_OUTPUT_TEXT;
+    out_opts->scene = BENCH_SCENE_STEADY;
     out_opts->worker_count = BENCH_SWEEP_WORKER_COUNT_DEFAULT;
     out_opts->workers[0] = 1u;
     out_opts->workers[1] = 2u;
@@ -227,6 +262,11 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
         } else if (strcmp(argv[i], "--format") == 0) {
             if (i + 1 >= argc
                 || bench_parse_output_format(argv[i + 1], &out_opts->output_format) != 0) {
+                return 1;
+            }
+            i += 1;
+        } else if (strcmp(argv[i], "--scene") == 0) {
+            if (i + 1 >= argc || bench_parse_scene(argv[i + 1], &out_opts->scene) != 0) {
                 return 1;
             }
             i += 1;
@@ -341,6 +381,28 @@ static void bench_damp_chunk(
     }
 }
 
+static void bench_churn_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    bench_churn_ctx_t* ctx;
+    bench_churn_t* churn_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 1u) {
+        return;
+    }
+
+    ctx = (bench_churn_ctx_t*)user_data;
+    churn_col = (bench_churn_t*)view->columns[0];
+    for (row = 0u; row < view->count; ++row) {
+        churn_col[row].resistance = (churn_col[row].resistance * ctx->blend) + ctx->drift;
+    }
+}
+
 static lt_status_t bench_compute_checksum(
     lt_world_t* world,
     lt_component_id_t position_id,
@@ -438,17 +500,26 @@ static int bench_run_scheduler_case(
     lt_component_id_t position_id;
     lt_component_id_t velocity_id;
     lt_component_id_t health_id;
+    lt_component_id_t churn_id;
     lt_query_term_t motion_terms[2];
     lt_query_term_t health_terms[1];
     lt_query_term_t damp_terms[1];
+    lt_query_term_t churn_terms[1];
     lt_query_desc_t query_desc;
     lt_query_t* motion_query;
     lt_query_t* health_query;
     lt_query_t* damp_query;
-    lt_query_schedule_entry_t entries[3];
+    lt_query_t* churn_query;
+    lt_query_schedule_entry_t entries[4];
     bench_motion_ctx_t motion_ctx;
     bench_health_ctx_t health_ctx;
     bench_damp_ctx_t damp_ctx;
+    bench_churn_ctx_t churn_ctx;
+    lt_entity_t* tracked_entities;
+    uint8_t* has_churn;
+    uint32_t toggle_count_per_frame;
+    uint64_t structural_ops;
+    uint32_t schedule_entry_count;
     uint32_t random_state;
     uint64_t spawn_start_ns;
     uint64_t spawn_end_ns;
@@ -479,6 +550,12 @@ static int bench_run_scheduler_case(
     motion_query = NULL;
     health_query = NULL;
     damp_query = NULL;
+    churn_query = NULL;
+    tracked_entities = NULL;
+    has_churn = NULL;
+    toggle_count_per_frame = 0u;
+    structural_ops = 0u;
+    schedule_entry_count = 0u;
 
     BENCH_CASE_REQUIRE_STATUS(lt_world_create(NULL, &world));
 
@@ -496,7 +573,29 @@ static int bench_run_scheduler_case(
     desc.align = (uint32_t)_Alignof(bench_health_t);
     BENCH_CASE_REQUIRE_STATUS(lt_register_component(world, &desc, &health_id));
 
+    churn_id = LT_COMPONENT_INVALID;
+    if (opts->scene == BENCH_SCENE_CHURN) {
+        desc.name = "Churn";
+        desc.size = (uint32_t)sizeof(bench_churn_t);
+        desc.align = (uint32_t)_Alignof(bench_churn_t);
+        BENCH_CASE_REQUIRE_STATUS(lt_register_component(world, &desc, &churn_id));
+    }
+
     BENCH_CASE_REQUIRE_STATUS(lt_world_reserve_entities(world, opts->entity_count));
+
+    if (opts->scene == BENCH_SCENE_CHURN && opts->entity_count > 0u) {
+        tracked_entities = (lt_entity_t*)malloc(sizeof(*tracked_entities) * (size_t)opts->entity_count);
+        has_churn = (uint8_t*)malloc(sizeof(*has_churn) * (size_t)opts->entity_count);
+        if (tracked_entities == NULL || has_churn == NULL) {
+            fprintf(stderr, "Error: failed to allocate churn tracking buffers\n");
+            goto cleanup;
+        }
+        memset(has_churn, 0, sizeof(*has_churn) * (size_t)opts->entity_count);
+        toggle_count_per_frame = opts->entity_count / 8u;
+        if (toggle_count_per_frame == 0u) {
+            toggle_count_per_frame = 1u;
+        }
+    }
 
     random_state = opts->seed;
     spawn_start_ns = bench_now_ns();
@@ -510,6 +609,7 @@ static int bench_run_scheduler_case(
         bench_vec3_t position;
         bench_vec3_t velocity;
         bench_health_t health;
+        bench_churn_t churn;
 
         BENCH_CASE_REQUIRE_STATUS(lt_entity_create(world, &entity));
 
@@ -526,6 +626,15 @@ static int bench_run_scheduler_case(
         BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, position_id, &position));
         BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, velocity_id, &velocity));
         BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, health_id, &health));
+
+        if (opts->scene == BENCH_SCENE_CHURN) {
+            tracked_entities[i] = entity;
+            if ((i & 1u) == 0u) {
+                churn.resistance = bench_rand_range(&random_state, 0.1f, 2.0f);
+                BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, churn_id, &churn));
+                has_churn[i] = 1u;
+            }
+        }
     }
 
     if (opts->use_defer != 0u) {
@@ -577,14 +686,69 @@ static int bench_run_scheduler_case(
     entries[2].query = damp_query;
     entries[2].callback = bench_damp_chunk;
     entries[2].user_data = &damp_ctx;
+    schedule_entry_count = 3u;
+
+    if (opts->scene == BENCH_SCENE_CHURN) {
+        memset(churn_terms, 0, sizeof(churn_terms));
+        churn_terms[0].component_id = churn_id;
+        churn_terms[0].access = LT_ACCESS_WRITE;
+
+        memset(&query_desc, 0, sizeof(query_desc));
+        query_desc.with_terms = churn_terms;
+        query_desc.with_count = 1u;
+        BENCH_CASE_REQUIRE_STATUS(lt_query_create(world, &query_desc, &churn_query));
+
+        churn_ctx.blend = 0.996f;
+        churn_ctx.drift = 0.0015f;
+
+        entries[3].query = churn_query;
+        entries[3].callback = bench_churn_chunk;
+        entries[3].user_data = &churn_ctx;
+        schedule_entry_count = 4u;
+    }
 
     sim_start_ns = bench_now_ns();
     for (frame = 0u; frame < opts->frame_count; ++frame) {
         lt_query_schedule_stats_t frame_stats;
 
-        BENCH_CASE_REQUIRE_STATUS(lt_query_schedule_execute(entries, 3u, workers, &frame_stats));
+        BENCH_CASE_REQUIRE_STATUS(
+            lt_query_schedule_execute(entries, schedule_entry_count, workers, &frame_stats));
         if (frame == 0u) {
             out_case->schedule_stats = frame_stats;
+        }
+
+        if (opts->scene == BENCH_SCENE_CHURN && opts->entity_count > 0u) {
+            uint32_t base;
+            uint32_t op;
+
+            base = (frame * toggle_count_per_frame) % opts->entity_count;
+            if (opts->use_defer != 0u) {
+                BENCH_CASE_REQUIRE_STATUS(lt_world_begin_defer(world));
+            }
+
+            for (op = 0u; op < toggle_count_per_frame; ++op) {
+                uint32_t idx;
+
+                idx = (base + op) % opts->entity_count;
+                if (has_churn[idx] != 0u) {
+                    BENCH_CASE_REQUIRE_STATUS(
+                        lt_remove_component(world, tracked_entities[idx], churn_id));
+                    has_churn[idx] = 0u;
+                } else {
+                    bench_churn_t churn;
+
+                    churn.resistance = bench_rand_range(&random_state, 0.1f, 2.0f);
+                    BENCH_CASE_REQUIRE_STATUS(
+                        lt_add_component(world, tracked_entities[idx], churn_id, &churn));
+                    has_churn[idx] = 1u;
+                }
+                structural_ops += 1u;
+            }
+
+            if (opts->use_defer != 0u) {
+                BENCH_CASE_REQUIRE_STATUS(lt_world_end_defer(world));
+                BENCH_CASE_REQUIRE_STATUS(lt_world_flush(world));
+            }
         }
     }
     sim_end_ns = bench_now_ns();
@@ -598,8 +762,10 @@ static int bench_run_scheduler_case(
         &out_case->touched_entities));
     BENCH_CASE_REQUIRE_STATUS(lt_world_get_stats(world, &out_case->stats));
 
-    out_case->touched_entities =
-        (uint64_t)out_case->stats.live_entities * (uint64_t)opts->frame_count * 3u;
+    out_case->structural_ops = structural_ops;
+    out_case->touched_entities = (uint64_t)out_case->stats.live_entities * (uint64_t)opts->frame_count
+                                 * (opts->scene == BENCH_SCENE_CHURN ? 4u : 3u)
+                                 + out_case->structural_ops;
 
     out_case->spawn_ms = (double)(spawn_end_ns - spawn_start_ns) / 1000000.0;
     out_case->simulate_ms = (double)(sim_end_ns - sim_start_ns) / 1000000.0;
@@ -608,20 +774,37 @@ static int bench_run_scheduler_case(
                                               ? 0.0
                                               : ((double)out_case->touched_entities / sim_seconds);
 
+    lt_query_destroy(churn_query);
     lt_query_destroy(damp_query);
     lt_query_destroy(health_query);
     lt_query_destroy(motion_query);
     lt_world_destroy(world);
+    free(has_churn);
+    free(tracked_entities);
 #undef BENCH_CASE_REQUIRE_STATUS
     return 0;
 
 cleanup:
+    lt_query_destroy(churn_query);
     lt_query_destroy(damp_query);
     lt_query_destroy(health_query);
     lt_query_destroy(motion_query);
     lt_world_destroy(world);
+    free(has_churn);
+    free(tracked_entities);
 #undef BENCH_CASE_REQUIRE_STATUS
     return 1;
+}
+
+static const char* bench_scene_name(bench_scene_t scene)
+{
+    switch (scene) {
+        case BENCH_SCENE_CHURN:
+            return "churn";
+        case BENCH_SCENE_STEADY:
+        default:
+            return "steady";
+    }
 }
 
 static void bench_print_results_text(
@@ -635,6 +818,7 @@ static void bench_print_results_text(
     printf("frames=%" PRIu32 "\n", opts->frame_count);
     printf("seed=%" PRIu32 "\n", opts->seed);
     printf("defer=%" PRIu32 "\n", (uint32_t)opts->use_defer);
+    printf("scene=%s\n", bench_scene_name(opts->scene));
     printf("spawn_ms=%.3f\n", results->spawn_ms);
     printf("simulate_ms=%.3f\n", results->simulate_ms);
     printf("touched_entities=%" PRIu64 "\n", results->touched_entities);
@@ -658,7 +842,7 @@ static void bench_print_results_text(
             "scheduler_workers=%" PRIu32 " scheduler_spawn_ms=%.3f scheduler_simulate_ms=%.3f"
             " scheduler_speedup_vs_serial=%.3f scheduler_touched_entities=%" PRIu64
             " scheduler_entities_per_sec=%.3f scheduler_checksum=%.6f"
-            " scheduler_batches=%" PRIu32 " scheduler_edges=%" PRIu32
+            " scheduler_structural_ops=%" PRIu64 " scheduler_batches=%" PRIu32 " scheduler_edges=%" PRIu32
             " scheduler_max_batch_size=%" PRIu32 "\n",
             c->workers,
             c->spawn_ms,
@@ -667,6 +851,7 @@ static void bench_print_results_text(
             c->touched_entities,
             c->simulate_entities_per_sec,
             c->checksum,
+            c->structural_ops,
             c->schedule_stats.batch_count,
             c->schedule_stats.edge_count,
             c->schedule_stats.max_batch_size);
@@ -681,7 +866,7 @@ static void bench_print_results_csv(const bench_options_t* opts, const bench_res
         "entities,frames,seed,defer,workers,spawn_ms,simulate_ms,speedup_vs_serial,"
         "touched_entities,simulate_entities_per_sec,checksum,stats_live,stats_archetypes,"
         "stats_chunks,stats_pending,stats_structural_moves,schedule_batch_count,"
-        "schedule_edge_count,schedule_max_batch_size\n");
+        "schedule_edge_count,schedule_max_batch_size,scheduler_structural_ops,scene\n");
 
     for (i = 0u; i < results->scheduler_case_count; ++i) {
         const bench_scheduler_case_t* c;
@@ -690,7 +875,7 @@ static void bench_print_results_csv(const bench_options_t* opts, const bench_res
         printf(
             "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ","
             "%.3f,%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,%" PRIu32 ",%" PRIu32 ",%" PRIu32
-            ",%" PRIu32 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
+            ",%" PRIu32 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu64 ",%s\n",
             opts->entity_count,
             opts->frame_count,
             opts->seed,
@@ -709,7 +894,9 @@ static void bench_print_results_csv(const bench_options_t* opts, const bench_res
             c->stats.structural_moves,
             c->schedule_stats.batch_count,
             c->schedule_stats.edge_count,
-            c->schedule_stats.max_batch_size);
+            c->schedule_stats.max_batch_size,
+            c->structural_ops,
+            bench_scene_name(opts->scene));
     }
 }
 
@@ -725,6 +912,7 @@ static void bench_print_results_json(
     printf("  \"frames\": %" PRIu32 ",\n", opts->frame_count);
     printf("  \"seed\": %" PRIu32 ",\n", opts->seed);
     printf("  \"defer\": %s,\n", opts->use_defer != 0u ? "true" : "false");
+    printf("  \"scene\": \"%s\",\n", bench_scene_name(opts->scene));
     printf("  \"spawn_ms\": %.3f,\n", results->spawn_ms);
     printf("  \"simulate_ms\": %.3f,\n", results->simulate_ms);
     printf("  \"touched_entities\": %" PRIu64 ",\n", results->touched_entities);
@@ -749,6 +937,7 @@ static void bench_print_results_json(
         printf("      \"touched_entities\": %" PRIu64 ",\n", c->touched_entities);
         printf("      \"simulate_entities_per_sec\": %.3f,\n", c->simulate_entities_per_sec);
         printf("      \"checksum\": %.6f,\n", c->checksum);
+        printf("      \"structural_ops\": %" PRIu64 ",\n", c->structural_ops);
         printf("      \"stats_live\": %" PRIu32 ",\n", c->stats.live_entities);
         printf("      \"stats_archetypes\": %" PRIu32 ",\n", c->stats.archetype_count);
         printf("      \"stats_chunks\": %" PRIu32 ",\n", c->stats.chunk_count);
