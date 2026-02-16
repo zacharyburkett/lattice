@@ -92,10 +92,23 @@ Exit criteria:
 - Parallel correctness tests.
 - Measurable speedup on multicore benchmark scenes.
 
+## Phase 7: Release Hardening
+
+Deliverables:
+
+- CI workflow for configure/build/test and benchmark smoke checks.
+- Sanitizer validation run (ASan/UBSan) in CI.
+- API/doc freeze pass to keep docs aligned with shipped headers.
+
+Exit criteria:
+
+- CI required checks are green on pull requests.
+- Sanitizer job passes for the baseline test suite.
+- README/API docs reflect current public API shape.
+
 ## Initial Testing Strategy
 
 - Unit tests: entity validity, archetype transitions, query filtering.
 - Property/fuzz tests: random structural operation sequences.
 - Regression tests: deterministic results across repeated seeds.
 - Performance tests: fixed scenes for movement, spawning, and wide queries.
-

@@ -3,7 +3,7 @@
 Lattice is a high-performance Entity-Component-System (ECS) framework in C for
 the Ardent engine ecosystem.
 
-Status: early implementation. Phase 5 diagnostics and benchmark tooling are now in place.
+Status: baseline feature set is in place; release hardening and API/docs freeze are in progress.
 
 ## Design Intent
 
