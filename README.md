@@ -3,7 +3,7 @@
 Lattice is a high-performance Entity-Component-System (ECS) framework in C for
 the Ardent engine ecosystem.
 
-Status: early implementation. Phase 4 deferred structural commands are now in place.
+Status: early implementation. Phase 5 diagnostics and benchmark tooling are now in place.
 
 ## Design Intent
 
@@ -31,9 +31,11 @@ Status: early implementation. Phase 4 deferred structural commands are now in pl
 - Query API for archetype-matched chunk iteration (`lt_query_*`).
 - Deferred structural command buffer (`lt_world_begin_defer`,
   `lt_world_end_defer`, `lt_world_flush`).
+- Trace hook diagnostics for runtime event capture (`lt_world_set_trace_hook`).
 - World stats snapshot API.
-- Unit tests for lifecycle, registration, structural moves, query filtering, and
-  destructor hooks.
+- Benchmark app (`lattice_bench`) for throughput and structural-layout snapshots.
+- Unit tests for lifecycle, registration, structural moves, query filtering,
+  deferred command semantics, and trace hook coverage.
 
 ## Quick Start
 

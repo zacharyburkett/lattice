@@ -4,6 +4,7 @@ project(lattice VERSION 0.1.0 LANGUAGES C)
 include(GNUInstallDirs)
 
 option(LATTICE_BUILD_TESTS "Build lattice tests" ON)
+option(LATTICE_BUILD_BENCHMARKS "Build lattice benchmark app" ON)
 
 add_library(lattice
     src/world.c
@@ -44,4 +45,15 @@ if(LATTICE_BUILD_TESTS)
     add_executable(lattice_tests tests/test_main.c)
     target_link_libraries(lattice_tests PRIVATE lattice)
     add_test(NAME lattice_tests COMMAND lattice_tests)
+endif()
+
+if(LATTICE_BUILD_BENCHMARKS)
+    add_executable(lattice_bench apps/bench/main.c)
+    target_link_libraries(lattice_bench PRIVATE lattice)
+    if(LATTICE_BUILD_TESTS)
+        add_test(
+            NAME lattice_bench_smoke
+            COMMAND lattice_bench --entities 10000 --frames 5 --seed 7
+        )
+    endif()
 endif()

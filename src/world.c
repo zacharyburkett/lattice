@@ -71,6 +71,8 @@ struct lt_archetype_s {
 struct lt_world_s {
     lt_allocator_t allocator;
     uint32_t target_chunk_bytes;
+    lt_trace_hook_fn trace_hook;
+    void* trace_user_data;
 
     lt_entity_slot_t* entities;
     uint32_t entity_capacity;
@@ -219,6 +221,32 @@ static void lt_free_bytes(lt_allocator_t* allocator, void* ptr, size_t size, siz
     allocator->free(allocator->user, ptr, size, align);
 }
 
+static void lt_trace_emit(
+    lt_world_t* world,
+    lt_trace_event_kind_t kind,
+    lt_status_t status,
+    lt_entity_t entity,
+    lt_component_id_t component_id,
+    uint32_t operation)
+{
+    lt_trace_event_t event;
+
+    if (world == NULL || world->trace_hook == NULL) {
+        return;
+    }
+
+    memset(&event, 0, sizeof(event));
+    event.kind = kind;
+    event.status = status;
+    event.entity = entity;
+    event.component_id = component_id;
+    event.operation = operation;
+    event.live_entities = world->live_entity_count;
+    event.pending_commands = world->deferred_count;
+    event.defer_depth = world->defer_depth;
+    world->trace_hook(&event, world->trace_user_data);
+}
+
 static void lt_deferred_op_release(lt_world_t* world, lt_deferred_op_t* op)
 {
     if (world == NULL || op == NULL) {
@@ -321,6 +349,13 @@ static lt_status_t lt_enqueue_destroy_entity(lt_world_t* world, lt_entity_t enti
 
     status = lt_deferred_grow(world, world->deferred_count + 1u);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_DEFER_ENQUEUE,
+            status,
+            entity,
+            LT_COMPONENT_INVALID,
+            (uint32_t)LT_DEFERRED_OP_DESTROY_ENTITY);
         return status;
     }
 
@@ -329,6 +364,13 @@ static lt_status_t lt_enqueue_destroy_entity(lt_world_t* world, lt_entity_t enti
     op->kind = LT_DEFERRED_OP_DESTROY_ENTITY;
     op->entity = entity;
     world->deferred_count += 1u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_DEFER_ENQUEUE,
+        LT_STATUS_OK,
+        entity,
+        LT_COMPONENT_INVALID,
+        (uint32_t)LT_DEFERRED_OP_DESTROY_ENTITY);
     return LT_STATUS_OK;
 }
 
@@ -346,6 +388,13 @@ static lt_status_t lt_enqueue_remove_component(
 
     status = lt_deferred_grow(world, world->deferred_count + 1u);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_DEFER_ENQUEUE,
+            status,
+            entity,
+            component_id,
+            (uint32_t)LT_DEFERRED_OP_REMOVE_COMPONENT);
         return status;
     }
 
@@ -355,6 +404,13 @@ static lt_status_t lt_enqueue_remove_component(
     op->entity = entity;
     op->component_id = component_id;
     world->deferred_count += 1u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_DEFER_ENQUEUE,
+        LT_STATUS_OK,
+        entity,
+        component_id,
+        (uint32_t)LT_DEFERRED_OP_REMOVE_COMPONENT);
     return LT_STATUS_OK;
 }
 
@@ -376,6 +432,13 @@ static lt_status_t lt_enqueue_add_component(
 
     status = lt_deferred_grow(world, world->deferred_count + 1u);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_DEFER_ENQUEUE,
+            status,
+            entity,
+            component_id,
+            (uint32_t)LT_DEFERRED_OP_ADD_COMPONENT);
         return status;
     }
 
@@ -388,6 +451,13 @@ static lt_status_t lt_enqueue_add_component(
     if (component->size > 0u && initial_value != NULL) {
         op->payload = lt_alloc_bytes(&world->allocator, component->size, component->align);
         if (op->payload == NULL) {
+            lt_trace_emit(
+                world,
+                LT_TRACE_EVENT_DEFER_ENQUEUE,
+                LT_STATUS_ALLOCATION_FAILED,
+                entity,
+                component_id,
+                (uint32_t)LT_DEFERRED_OP_ADD_COMPONENT);
             return LT_STATUS_ALLOCATION_FAILED;
         }
         memcpy(op->payload, initial_value, component->size);
@@ -396,6 +466,13 @@ static lt_status_t lt_enqueue_add_component(
     }
 
     world->deferred_count += 1u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_DEFER_ENQUEUE,
+        LT_STATUS_OK,
+        entity,
+        component_id,
+        (uint32_t)LT_DEFERRED_OP_ADD_COMPONENT);
     return LT_STATUS_OK;
 }
 
@@ -1727,6 +1804,17 @@ lt_status_t lt_world_reserve_components(lt_world_t* world, uint32_t component_ca
     return lt_grow_components(world, component_capacity);
 }
 
+lt_status_t lt_world_set_trace_hook(lt_world_t* world, lt_trace_hook_fn hook, void* user_data)
+{
+    if (world == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    world->trace_hook = hook;
+    world->trace_user_data = user_data;
+    return LT_STATUS_OK;
+}
+
 lt_status_t lt_world_begin_defer(lt_world_t* world)
 {
     if (world == NULL) {
@@ -1738,6 +1826,13 @@ lt_status_t lt_world_begin_defer(lt_world_t* world)
     }
 
     world->defer_depth += 1u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_DEFER_BEGIN,
+        LT_STATUS_OK,
+        LT_ENTITY_NULL,
+        LT_COMPONENT_INVALID,
+        0u);
     return LT_STATUS_OK;
 }
 
@@ -1752,6 +1847,13 @@ lt_status_t lt_world_end_defer(lt_world_t* world)
     }
 
     world->defer_depth -= 1u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_DEFER_END,
+        LT_STATUS_OK,
+        LT_ENTITY_NULL,
+        LT_COMPONENT_INVALID,
+        0u);
     return LT_STATUS_OK;
 }
 
@@ -1767,6 +1869,14 @@ lt_status_t lt_world_flush(lt_world_t* world)
     if (world->defer_depth != 0u) {
         return LT_STATUS_CONFLICT;
     }
+
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_FLUSH_BEGIN,
+        LT_STATUS_OK,
+        LT_ENTITY_NULL,
+        LT_COMPONENT_INVALID,
+        0u);
 
     status = LT_STATUS_OK;
     for (i = 0u; i < world->deferred_count; ++i) {
@@ -1789,11 +1899,33 @@ lt_status_t lt_world_flush(lt_world_t* world)
         }
 
         if (status != LT_STATUS_OK) {
+            lt_trace_emit(
+                world,
+                LT_TRACE_EVENT_FLUSH_APPLY,
+                status,
+                op->entity,
+                op->component_id,
+                (uint32_t)op->kind);
             break;
         }
+
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_FLUSH_APPLY,
+            LT_STATUS_OK,
+            op->entity,
+            op->component_id,
+            (uint32_t)op->kind);
     }
 
     lt_deferred_clear(world);
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_FLUSH_END,
+        status,
+        LT_ENTITY_NULL,
+        LT_COMPONENT_INVALID,
+        0u);
     return status;
 }
 
@@ -1863,6 +1995,13 @@ lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity)
 
     world->live_entity_count += 1u;
     *out_entity = entity;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_ENTITY_CREATE,
+        LT_STATUS_OK,
+        entity,
+        LT_COMPONENT_INVALID,
+        0u);
     return LT_STATUS_OK;
 }
 
@@ -1885,6 +2024,13 @@ lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity)
 
     status = lt_world_get_live_slot(world, entity, &slot);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_ENTITY_DESTROY,
+            status,
+            entity,
+            LT_COMPONENT_INVALID,
+            0u);
         return status;
     }
 
@@ -1927,6 +2073,13 @@ lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity)
         world->live_entity_count -= 1u;
     }
 
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_ENTITY_DESTROY,
+        LT_STATUS_OK,
+        entity,
+        LT_COMPONENT_INVALID,
+        0u);
     return LT_STATUS_OK;
 }
 
@@ -1985,6 +2138,13 @@ lt_status_t lt_add_component(
 
     status = lt_world_get_live_slot(world, entity, &slot);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_COMPONENT_ADD,
+            status,
+            entity,
+            component_id,
+            0u);
         return status;
     }
 
@@ -1993,6 +2153,13 @@ lt_status_t lt_add_component(
     src_row = slot->row;
 
     if (lt_archetype_find_component_index(src_archetype, component_id, NULL)) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_COMPONENT_ADD,
+            LT_STATUS_ALREADY_EXISTS,
+            entity,
+            component_id,
+            0u);
         return LT_STATUS_ALREADY_EXISTS;
     }
 
@@ -2048,6 +2215,13 @@ lt_status_t lt_add_component(
     slot->row = dst_row;
 
     lt_archetype_swap_remove_row(world, src_archetype, src_chunk, src_row);
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_COMPONENT_ADD,
+        LT_STATUS_OK,
+        entity,
+        component_id,
+        0u);
     return LT_STATUS_OK;
 }
 
@@ -2083,6 +2257,13 @@ lt_status_t lt_remove_component(
 
     status = lt_world_get_live_slot(world, entity, &slot);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_COMPONENT_REMOVE,
+            status,
+            entity,
+            component_id,
+            0u);
         return status;
     }
 
@@ -2091,6 +2272,13 @@ lt_status_t lt_remove_component(
     src_row = slot->row;
 
     if (!lt_archetype_find_component_index(src_archetype, component_id, &removed_index)) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_COMPONENT_REMOVE,
+            LT_STATUS_NOT_FOUND,
+            entity,
+            component_id,
+            0u);
         return LT_STATUS_NOT_FOUND;
     }
 
@@ -2150,6 +2338,13 @@ lt_status_t lt_remove_component(
     slot->row = dst_row;
 
     lt_archetype_swap_remove_row(world, src_archetype, src_chunk, src_row);
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_COMPONENT_REMOVE,
+        LT_STATUS_OK,
+        entity,
+        component_id,
+        0u);
     return LT_STATUS_OK;
 }
 

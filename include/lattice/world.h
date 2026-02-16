@@ -62,6 +62,32 @@ typedef struct lt_world_stats_s {
     uint32_t defer_depth;
 } lt_world_stats_t;
 
+typedef enum lt_trace_event_kind_e {
+    LT_TRACE_EVENT_DEFER_BEGIN = 1,
+    LT_TRACE_EVENT_DEFER_END = 2,
+    LT_TRACE_EVENT_DEFER_ENQUEUE = 3,
+    LT_TRACE_EVENT_FLUSH_BEGIN = 4,
+    LT_TRACE_EVENT_FLUSH_APPLY = 5,
+    LT_TRACE_EVENT_FLUSH_END = 6,
+    LT_TRACE_EVENT_ENTITY_CREATE = 7,
+    LT_TRACE_EVENT_ENTITY_DESTROY = 8,
+    LT_TRACE_EVENT_COMPONENT_ADD = 9,
+    LT_TRACE_EVENT_COMPONENT_REMOVE = 10
+} lt_trace_event_kind_t;
+
+typedef struct lt_trace_event_s {
+    lt_trace_event_kind_t kind;
+    lt_status_t status;
+    lt_entity_t entity;
+    lt_component_id_t component_id;
+    uint32_t operation;
+    uint32_t live_entities;
+    uint32_t pending_commands;
+    uint32_t defer_depth;
+} lt_trace_event_t;
+
+typedef void (*lt_trace_hook_fn)(const lt_trace_event_t* event, void* user_data);
+
 typedef enum lt_access_e {
     LT_ACCESS_READ = 0,
     LT_ACCESS_WRITE = 1
@@ -102,6 +128,7 @@ lt_status_t lt_world_reserve_components(lt_world_t* world, uint32_t component_ca
 lt_status_t lt_world_begin_defer(lt_world_t* world);
 lt_status_t lt_world_end_defer(lt_world_t* world);
 lt_status_t lt_world_flush(lt_world_t* world);
+lt_status_t lt_world_set_trace_hook(lt_world_t* world, lt_trace_hook_fn hook, void* user_data);
 
 lt_status_t lt_entity_create(lt_world_t* world, lt_entity_t* out_entity);
 lt_status_t lt_entity_destroy(lt_world_t* world, lt_entity_t entity);

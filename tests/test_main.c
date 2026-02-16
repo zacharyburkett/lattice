@@ -38,6 +38,22 @@ typedef struct test_vec3_s {
     float z;
 } test_vec3_t;
 
+typedef struct test_trace_capture_s {
+    uint32_t total;
+    uint32_t defer_begin_count;
+    uint32_t defer_end_count;
+    uint32_t defer_enqueue_count;
+    uint32_t flush_begin_count;
+    uint32_t flush_apply_count;
+    uint32_t flush_end_count;
+    uint32_t entity_create_count;
+    uint32_t entity_destroy_count;
+    uint32_t component_add_count;
+    uint32_t component_remove_count;
+    lt_status_t last_status;
+    lt_trace_event_kind_t last_kind;
+} test_trace_capture_t;
+
 static void* test_alloc_only(void* user, size_t size, size_t align)
 {
     (void)user;
@@ -54,6 +70,55 @@ static void test_counting_dtor(void* dst, uint32_t count, void* user)
 
     total = (int*)user;
     *total += (int)count;
+}
+
+static void test_trace_hook(const lt_trace_event_t* event, void* user_data)
+{
+    test_trace_capture_t* capture;
+
+    if (event == NULL || user_data == NULL) {
+        return;
+    }
+
+    capture = (test_trace_capture_t*)user_data;
+    capture->total += 1u;
+    capture->last_status = event->status;
+    capture->last_kind = event->kind;
+
+    switch (event->kind) {
+        case LT_TRACE_EVENT_DEFER_BEGIN:
+            capture->defer_begin_count += 1u;
+            break;
+        case LT_TRACE_EVENT_DEFER_END:
+            capture->defer_end_count += 1u;
+            break;
+        case LT_TRACE_EVENT_DEFER_ENQUEUE:
+            capture->defer_enqueue_count += 1u;
+            break;
+        case LT_TRACE_EVENT_FLUSH_BEGIN:
+            capture->flush_begin_count += 1u;
+            break;
+        case LT_TRACE_EVENT_FLUSH_APPLY:
+            capture->flush_apply_count += 1u;
+            break;
+        case LT_TRACE_EVENT_FLUSH_END:
+            capture->flush_end_count += 1u;
+            break;
+        case LT_TRACE_EVENT_ENTITY_CREATE:
+            capture->entity_create_count += 1u;
+            break;
+        case LT_TRACE_EVENT_ENTITY_DESTROY:
+            capture->entity_destroy_count += 1u;
+            break;
+        case LT_TRACE_EVENT_COMPONENT_ADD:
+            capture->component_add_count += 1u;
+            break;
+        case LT_TRACE_EVENT_COMPONENT_REMOVE:
+            capture->component_remove_count += 1u;
+            break;
+        default:
+            break;
+    }
 }
 
 static int register_vec3_components(
@@ -707,6 +772,52 @@ static int test_deferred_command_ordering(void)
     return 0;
 }
 
+static int test_trace_hook_reports_core_events(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t entity;
+    test_vec3_t position;
+    test_trace_capture_t capture;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    memset(&capture, 0, sizeof(capture));
+    ASSERT_STATUS(lt_world_set_trace_hook(world, test_trace_hook, &capture), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+    position.x = 1.0f;
+    position.y = 2.0f;
+    position.z = 3.0f;
+
+    ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world), LT_STATUS_OK);
+    ASSERT_STATUS(lt_remove_component(world, entity, position_id), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_destroy(world, entity), LT_STATUS_OK);
+
+    ASSERT_TRUE(capture.total > 0u);
+    ASSERT_TRUE(capture.entity_create_count >= 1u);
+    ASSERT_TRUE(capture.defer_begin_count == 1u);
+    ASSERT_TRUE(capture.defer_end_count == 1u);
+    ASSERT_TRUE(capture.defer_enqueue_count >= 1u);
+    ASSERT_TRUE(capture.flush_begin_count == 1u);
+    ASSERT_TRUE(capture.flush_apply_count >= 1u);
+    ASSERT_TRUE(capture.flush_end_count == 1u);
+    ASSERT_TRUE(capture.component_add_count >= 1u);
+    ASSERT_TRUE(capture.component_remove_count >= 1u);
+    ASSERT_TRUE(capture.entity_destroy_count >= 1u);
+    ASSERT_TRUE(capture.last_status == LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_world_set_trace_hook(world, NULL, NULL), LT_STATUS_OK);
+    lt_world_destroy(world);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_destroy_defaults);
@@ -724,5 +835,6 @@ int main(void)
     RUN_TEST(test_deferred_component_visibility_and_payload_copy);
     RUN_TEST(test_deferred_flush_conflict_and_destroy);
     RUN_TEST(test_deferred_command_ordering);
+    RUN_TEST(test_trace_hook_reports_core_events);
     return 0;
 }
