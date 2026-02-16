@@ -59,15 +59,24 @@ if(LATTICE_BUILD_BENCHMARKS)
     if(LATTICE_BUILD_TESTS)
         add_test(
             NAME lattice_bench_smoke
-            COMMAND lattice_bench --entities 10000 --frames 5 --seed 7
+            COMMAND ${CMAKE_COMMAND}
+                -DBENCH_EXE=$<TARGET_FILE:lattice_bench>
+                -DMODE=text
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
         )
         add_test(
             NAME lattice_bench_smoke_csv
-            COMMAND lattice_bench --entities 10000 --frames 5 --seed 7 --format csv
+            COMMAND ${CMAKE_COMMAND}
+                -DBENCH_EXE=$<TARGET_FILE:lattice_bench>
+                -DMODE=csv
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
         )
         add_test(
             NAME lattice_bench_smoke_json
-            COMMAND lattice_bench --entities 10000 --frames 5 --seed 7 --format json
+            COMMAND ${CMAKE_COMMAND}
+                -DBENCH_EXE=$<TARGET_FILE:lattice_bench>
+                -DMODE=json
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
         )
     endif()
 endif()

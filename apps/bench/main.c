@@ -12,6 +12,10 @@ typedef struct bench_vec3_s {
     float z;
 } bench_vec3_t;
 
+typedef struct bench_health_s {
+    float value;
+} bench_health_t;
+
 typedef enum bench_output_format_e {
     BENCH_OUTPUT_TEXT = 0,
     BENCH_OUTPUT_CSV = 1,
@@ -26,13 +30,41 @@ typedef struct bench_options_s {
     bench_output_format_t output_format;
 } bench_options_t;
 
+typedef struct bench_scheduler_case_s {
+    uint32_t workers;
+    double spawn_ms;
+    double simulate_ms;
+    double simulate_entities_per_sec;
+    uint64_t touched_entities;
+    double checksum;
+    double speedup_vs_serial;
+    lt_world_stats_t stats;
+    lt_query_schedule_stats_t schedule_stats;
+} bench_scheduler_case_t;
+
+enum { BENCH_SWEEP_WORKER_COUNT = 4 };
+
 typedef struct bench_results_s {
     double spawn_ms;
     double simulate_ms;
     double simulate_entities_per_sec;
     uint64_t touched_entities;
     double checksum;
+    uint32_t scheduler_case_count;
+    bench_scheduler_case_t scheduler_cases[BENCH_SWEEP_WORKER_COUNT];
 } bench_results_t;
+
+typedef struct bench_motion_ctx_s {
+    float dt;
+} bench_motion_ctx_t;
+
+typedef struct bench_health_ctx_s {
+    float drain;
+} bench_health_ctx_t;
+
+typedef struct bench_damp_ctx_s {
+    float factor;
+} bench_damp_ctx_t;
 
 static uint64_t bench_now_ns(void)
 {
@@ -163,11 +195,371 @@ static float bench_rand_range(uint32_t* state, float min_value, float max_value)
     return min_value + (max_value - min_value) * t;
 }
 
+static void bench_motion_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    bench_motion_ctx_t* ctx;
+    bench_vec3_t* position_col;
+    bench_vec3_t* velocity_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 2u) {
+        return;
+    }
+
+    ctx = (bench_motion_ctx_t*)user_data;
+    position_col = (bench_vec3_t*)view->columns[0];
+    velocity_col = (bench_vec3_t*)view->columns[1];
+
+    for (row = 0u; row < view->count; ++row) {
+        position_col[row].x += velocity_col[row].x * ctx->dt;
+        position_col[row].y += velocity_col[row].y * ctx->dt;
+        position_col[row].z += velocity_col[row].z * ctx->dt;
+    }
+}
+
+static void bench_health_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    bench_health_ctx_t* ctx;
+    bench_health_t* health_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 1u) {
+        return;
+    }
+
+    ctx = (bench_health_ctx_t*)user_data;
+    health_col = (bench_health_t*)view->columns[0];
+
+    for (row = 0u; row < view->count; ++row) {
+        health_col[row].value -= ctx->drain;
+    }
+}
+
+static void bench_damp_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    bench_damp_ctx_t* ctx;
+    bench_vec3_t* velocity_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 1u) {
+        return;
+    }
+
+    ctx = (bench_damp_ctx_t*)user_data;
+    velocity_col = (bench_vec3_t*)view->columns[0];
+
+    for (row = 0u; row < view->count; ++row) {
+        velocity_col[row].x *= ctx->factor;
+        velocity_col[row].y *= ctx->factor;
+        velocity_col[row].z *= ctx->factor;
+    }
+}
+
+static lt_status_t bench_compute_checksum(
+    lt_world_t* world,
+    lt_component_id_t position_id,
+    lt_component_id_t velocity_id,
+    lt_component_id_t health_id,
+    double* out_checksum,
+    uint64_t* out_entity_count)
+{
+    lt_query_term_t terms[3];
+    lt_query_desc_t desc;
+    lt_query_t* query;
+    lt_query_iter_t iter;
+    lt_chunk_view_t view;
+    uint8_t has_value;
+    double checksum;
+    uint64_t entity_count;
+    lt_status_t status;
+    uint32_t i;
+
+    if (world == NULL || out_checksum == NULL || out_entity_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_checksum = 0.0;
+    *out_entity_count = 0u;
+
+    memset(terms, 0, sizeof(terms));
+    terms[0].component_id = position_id;
+    terms[0].access = LT_ACCESS_READ;
+    terms[1].component_id = velocity_id;
+    terms[1].access = LT_ACCESS_READ;
+    terms[2].component_id = health_id;
+    terms[2].access = LT_ACCESS_READ;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.with_terms = terms;
+    desc.with_count = 3u;
+
+    status = lt_query_create(world, &desc, &query);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+
+    status = lt_query_iter_begin(query, &iter);
+    if (status != LT_STATUS_OK) {
+        lt_query_destroy(query);
+        return status;
+    }
+
+    checksum = 0.0;
+    entity_count = 0u;
+    while (1) {
+        bench_vec3_t* position_col;
+        bench_vec3_t* velocity_col;
+        bench_health_t* health_col;
+
+        status = lt_query_iter_next(&iter, &view, &has_value);
+        if (status != LT_STATUS_OK) {
+            lt_query_destroy(query);
+            return status;
+        }
+        if (has_value == 0u) {
+            break;
+        }
+
+        position_col = (bench_vec3_t*)view.columns[0];
+        velocity_col = (bench_vec3_t*)view.columns[1];
+        health_col = (bench_health_t*)view.columns[2];
+        for (i = 0u; i < view.count; ++i) {
+            checksum += (double)position_col[i].x;
+            checksum += (double)position_col[i].y * 0.25;
+            checksum += (double)position_col[i].z * 0.125;
+            checksum += (double)velocity_col[i].x * 0.5;
+            checksum += (double)velocity_col[i].y * 0.125;
+            checksum += (double)velocity_col[i].z * 0.0625;
+            checksum += (double)health_col[i].value * 0.03125;
+        }
+
+        entity_count += (uint64_t)view.count;
+    }
+
+    lt_query_destroy(query);
+    *out_checksum = checksum;
+    *out_entity_count = entity_count;
+    return LT_STATUS_OK;
+}
+
+static int bench_run_scheduler_case(
+    const bench_options_t* opts,
+    uint32_t workers,
+    bench_scheduler_case_t* out_case)
+{
+    lt_world_t* world;
+    lt_component_desc_t desc;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_component_id_t health_id;
+    lt_query_term_t motion_terms[2];
+    lt_query_term_t health_terms[1];
+    lt_query_term_t damp_terms[1];
+    lt_query_desc_t query_desc;
+    lt_query_t* motion_query;
+    lt_query_t* health_query;
+    lt_query_t* damp_query;
+    lt_query_schedule_entry_t entries[3];
+    bench_motion_ctx_t motion_ctx;
+    bench_health_ctx_t health_ctx;
+    bench_damp_ctx_t damp_ctx;
+    uint32_t random_state;
+    uint64_t spawn_start_ns;
+    uint64_t spawn_end_ns;
+    uint64_t sim_start_ns;
+    uint64_t sim_end_ns;
+    uint32_t i;
+    uint32_t frame;
+    double sim_seconds;
+    lt_status_t status;
+
+#define BENCH_CASE_REQUIRE_STATUS(call_expr)                                                   \
+    do {                                                                                        \
+        status = (call_expr);                                                                   \
+        if (status != LT_STATUS_OK) {                                                          \
+            fprintf(stderr, "Error: %s failed with %s\\n", #call_expr, lt_status_string(status)); \
+            goto cleanup;                                                                       \
+        }                                                                                       \
+    } while (0)
+
+    if (opts == NULL || out_case == NULL || workers == 0u) {
+        return 1;
+    }
+
+    memset(out_case, 0, sizeof(*out_case));
+    out_case->workers = workers;
+
+    world = NULL;
+    motion_query = NULL;
+    health_query = NULL;
+    damp_query = NULL;
+
+    BENCH_CASE_REQUIRE_STATUS(lt_world_create(NULL, &world));
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "Position";
+    desc.size = (uint32_t)sizeof(bench_vec3_t);
+    desc.align = (uint32_t)_Alignof(bench_vec3_t);
+    BENCH_CASE_REQUIRE_STATUS(lt_register_component(world, &desc, &position_id));
+
+    desc.name = "Velocity";
+    BENCH_CASE_REQUIRE_STATUS(lt_register_component(world, &desc, &velocity_id));
+
+    desc.name = "Health";
+    desc.size = (uint32_t)sizeof(bench_health_t);
+    desc.align = (uint32_t)_Alignof(bench_health_t);
+    BENCH_CASE_REQUIRE_STATUS(lt_register_component(world, &desc, &health_id));
+
+    BENCH_CASE_REQUIRE_STATUS(lt_world_reserve_entities(world, opts->entity_count));
+
+    random_state = opts->seed;
+    spawn_start_ns = bench_now_ns();
+
+    if (opts->use_defer != 0u) {
+        BENCH_CASE_REQUIRE_STATUS(lt_world_begin_defer(world));
+    }
+
+    for (i = 0u; i < opts->entity_count; ++i) {
+        lt_entity_t entity;
+        bench_vec3_t position;
+        bench_vec3_t velocity;
+        bench_health_t health;
+
+        BENCH_CASE_REQUIRE_STATUS(lt_entity_create(world, &entity));
+
+        position.x = bench_rand_range(&random_state, -100.0f, 100.0f);
+        position.y = bench_rand_range(&random_state, -100.0f, 100.0f);
+        position.z = bench_rand_range(&random_state, -100.0f, 100.0f);
+
+        velocity.x = bench_rand_range(&random_state, -2.0f, 2.0f);
+        velocity.y = bench_rand_range(&random_state, -2.0f, 2.0f);
+        velocity.z = bench_rand_range(&random_state, -2.0f, 2.0f);
+
+        health.value = bench_rand_range(&random_state, 50.0f, 150.0f);
+
+        BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, position_id, &position));
+        BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, velocity_id, &velocity));
+        BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, health_id, &health));
+    }
+
+    if (opts->use_defer != 0u) {
+        BENCH_CASE_REQUIRE_STATUS(lt_world_end_defer(world));
+        BENCH_CASE_REQUIRE_STATUS(lt_world_flush(world));
+    }
+
+    spawn_end_ns = bench_now_ns();
+
+    memset(motion_terms, 0, sizeof(motion_terms));
+    motion_terms[0].component_id = position_id;
+    motion_terms[0].access = LT_ACCESS_WRITE;
+    motion_terms[1].component_id = velocity_id;
+    motion_terms[1].access = LT_ACCESS_READ;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = motion_terms;
+    query_desc.with_count = 2u;
+    BENCH_CASE_REQUIRE_STATUS(lt_query_create(world, &query_desc, &motion_query));
+
+    memset(health_terms, 0, sizeof(health_terms));
+    health_terms[0].component_id = health_id;
+    health_terms[0].access = LT_ACCESS_WRITE;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = health_terms;
+    query_desc.with_count = 1u;
+    BENCH_CASE_REQUIRE_STATUS(lt_query_create(world, &query_desc, &health_query));
+
+    memset(damp_terms, 0, sizeof(damp_terms));
+    damp_terms[0].component_id = velocity_id;
+    damp_terms[0].access = LT_ACCESS_WRITE;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = damp_terms;
+    query_desc.with_count = 1u;
+    BENCH_CASE_REQUIRE_STATUS(lt_query_create(world, &query_desc, &damp_query));
+
+    motion_ctx.dt = 1.0f / 60.0f;
+    health_ctx.drain = 0.01f;
+    damp_ctx.factor = 0.9995f;
+
+    entries[0].query = motion_query;
+    entries[0].callback = bench_motion_chunk;
+    entries[0].user_data = &motion_ctx;
+    entries[1].query = health_query;
+    entries[1].callback = bench_health_chunk;
+    entries[1].user_data = &health_ctx;
+    entries[2].query = damp_query;
+    entries[2].callback = bench_damp_chunk;
+    entries[2].user_data = &damp_ctx;
+
+    sim_start_ns = bench_now_ns();
+    for (frame = 0u; frame < opts->frame_count; ++frame) {
+        lt_query_schedule_stats_t frame_stats;
+
+        BENCH_CASE_REQUIRE_STATUS(lt_query_schedule_execute(entries, 3u, workers, &frame_stats));
+        if (frame == 0u) {
+            out_case->schedule_stats = frame_stats;
+        }
+    }
+    sim_end_ns = bench_now_ns();
+
+    BENCH_CASE_REQUIRE_STATUS(bench_compute_checksum(
+        world,
+        position_id,
+        velocity_id,
+        health_id,
+        &out_case->checksum,
+        &out_case->touched_entities));
+    BENCH_CASE_REQUIRE_STATUS(lt_world_get_stats(world, &out_case->stats));
+
+    out_case->touched_entities =
+        (uint64_t)out_case->stats.live_entities * (uint64_t)opts->frame_count * 3u;
+
+    out_case->spawn_ms = (double)(spawn_end_ns - spawn_start_ns) / 1000000.0;
+    out_case->simulate_ms = (double)(sim_end_ns - sim_start_ns) / 1000000.0;
+    sim_seconds = (double)(sim_end_ns - sim_start_ns) / 1000000000.0;
+    out_case->simulate_entities_per_sec = out_case->touched_entities == 0u || sim_seconds <= 0.0
+                                              ? 0.0
+                                              : ((double)out_case->touched_entities / sim_seconds);
+
+    lt_query_destroy(damp_query);
+    lt_query_destroy(health_query);
+    lt_query_destroy(motion_query);
+    lt_world_destroy(world);
+#undef BENCH_CASE_REQUIRE_STATUS
+    return 0;
+
+cleanup:
+    lt_query_destroy(damp_query);
+    lt_query_destroy(health_query);
+    lt_query_destroy(motion_query);
+    lt_world_destroy(world);
+#undef BENCH_CASE_REQUIRE_STATUS
+    return 1;
+}
+
 static void bench_print_results_text(
     const bench_options_t* opts,
     const bench_results_t* results,
     const lt_world_stats_t* stats)
 {
+    uint32_t i;
+
     printf("entities=%" PRIu32 "\n", opts->entity_count);
     printf("frames=%" PRIu32 "\n", opts->frame_count);
     printf("seed=%" PRIu32 "\n", opts->seed);
@@ -185,33 +577,69 @@ static void bench_print_results_text(
         stats->chunk_count,
         stats->pending_commands,
         stats->structural_moves);
+
+    printf("scheduler_sweep_count=%" PRIu32 "\n", results->scheduler_case_count);
+    for (i = 0u; i < results->scheduler_case_count; ++i) {
+        const bench_scheduler_case_t* c;
+
+        c = &results->scheduler_cases[i];
+        printf(
+            "scheduler_workers=%" PRIu32 " scheduler_spawn_ms=%.3f scheduler_simulate_ms=%.3f"
+            " scheduler_speedup_vs_serial=%.3f scheduler_touched_entities=%" PRIu64
+            " scheduler_entities_per_sec=%.3f scheduler_checksum=%.6f"
+            " scheduler_batches=%" PRIu32 " scheduler_edges=%" PRIu32
+            " scheduler_max_batch_size=%" PRIu32 "\n",
+            c->workers,
+            c->spawn_ms,
+            c->simulate_ms,
+            c->speedup_vs_serial,
+            c->touched_entities,
+            c->simulate_entities_per_sec,
+            c->checksum,
+            c->schedule_stats.batch_count,
+            c->schedule_stats.edge_count,
+            c->schedule_stats.max_batch_size);
+    }
 }
 
-static void bench_print_results_csv(
-    const bench_options_t* opts,
-    const bench_results_t* results,
-    const lt_world_stats_t* stats)
+static void bench_print_results_csv(const bench_options_t* opts, const bench_results_t* results)
 {
+    uint32_t i;
+
     printf(
-        "entities,frames,seed,defer,spawn_ms,simulate_ms,touched_entities,simulate_entities_per_sec,checksum,"
-        "stats_live,stats_archetypes,stats_chunks,stats_pending,stats_structural_moves\n");
-    printf(
-        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,%" PRIu32
-        ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu64 "\n",
-        opts->entity_count,
-        opts->frame_count,
-        opts->seed,
-        (uint32_t)opts->use_defer,
-        results->spawn_ms,
-        results->simulate_ms,
-        results->touched_entities,
-        results->simulate_entities_per_sec,
-        results->checksum,
-        stats->live_entities,
-        stats->archetype_count,
-        stats->chunk_count,
-        stats->pending_commands,
-        stats->structural_moves);
+        "entities,frames,seed,defer,workers,spawn_ms,simulate_ms,speedup_vs_serial,"
+        "touched_entities,simulate_entities_per_sec,checksum,stats_live,stats_archetypes,"
+        "stats_chunks,stats_pending,stats_structural_moves,schedule_batch_count,"
+        "schedule_edge_count,schedule_max_batch_size\n");
+
+    for (i = 0u; i < results->scheduler_case_count; ++i) {
+        const bench_scheduler_case_t* c;
+
+        c = &results->scheduler_cases[i];
+        printf(
+            "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ","
+            "%.3f,%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,%" PRIu32 ",%" PRIu32 ",%" PRIu32
+            ",%" PRIu32 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
+            opts->entity_count,
+            opts->frame_count,
+            opts->seed,
+            (uint32_t)opts->use_defer,
+            c->workers,
+            c->spawn_ms,
+            c->simulate_ms,
+            c->speedup_vs_serial,
+            c->touched_entities,
+            c->simulate_entities_per_sec,
+            c->checksum,
+            c->stats.live_entities,
+            c->stats.archetype_count,
+            c->stats.chunk_count,
+            c->stats.pending_commands,
+            c->stats.structural_moves,
+            c->schedule_stats.batch_count,
+            c->schedule_stats.edge_count,
+            c->schedule_stats.max_batch_size);
+    }
 }
 
 static void bench_print_results_json(
@@ -219,6 +647,8 @@ static void bench_print_results_json(
     const bench_results_t* results,
     const lt_world_stats_t* stats)
 {
+    uint32_t i;
+
     printf("{\n");
     printf("  \"entities\": %" PRIu32 ",\n", opts->entity_count);
     printf("  \"frames\": %" PRIu32 ",\n", opts->frame_count);
@@ -233,7 +663,35 @@ static void bench_print_results_json(
     printf("  \"stats_archetypes\": %" PRIu32 ",\n", stats->archetype_count);
     printf("  \"stats_chunks\": %" PRIu32 ",\n", stats->chunk_count);
     printf("  \"stats_pending\": %" PRIu32 ",\n", stats->pending_commands);
-    printf("  \"stats_structural_moves\": %" PRIu64 "\n", stats->structural_moves);
+    printf("  \"stats_structural_moves\": %" PRIu64 ",\n", stats->structural_moves);
+    printf("  \"scheduler_sweep\": [\n");
+
+    for (i = 0u; i < results->scheduler_case_count; ++i) {
+        const bench_scheduler_case_t* c;
+
+        c = &results->scheduler_cases[i];
+        printf("    {\n");
+        printf("      \"workers\": %" PRIu32 ",\n", c->workers);
+        printf("      \"spawn_ms\": %.3f,\n", c->spawn_ms);
+        printf("      \"simulate_ms\": %.3f,\n", c->simulate_ms);
+        printf("      \"speedup_vs_serial\": %.3f,\n", c->speedup_vs_serial);
+        printf("      \"touched_entities\": %" PRIu64 ",\n", c->touched_entities);
+        printf("      \"simulate_entities_per_sec\": %.3f,\n", c->simulate_entities_per_sec);
+        printf("      \"checksum\": %.6f,\n", c->checksum);
+        printf("      \"stats_live\": %" PRIu32 ",\n", c->stats.live_entities);
+        printf("      \"stats_archetypes\": %" PRIu32 ",\n", c->stats.archetype_count);
+        printf("      \"stats_chunks\": %" PRIu32 ",\n", c->stats.chunk_count);
+        printf("      \"stats_pending\": %" PRIu32 ",\n", c->stats.pending_commands);
+        printf("      \"stats_structural_moves\": %" PRIu64 ",\n", c->stats.structural_moves);
+        printf("      \"schedule_batch_count\": %" PRIu32 ",\n", c->schedule_stats.batch_count);
+        printf("      \"schedule_edge_count\": %" PRIu32 ",\n", c->schedule_stats.edge_count);
+        printf(
+            "      \"schedule_max_batch_size\": %" PRIu32 "\n",
+            c->schedule_stats.max_batch_size);
+        printf("    }%s\n", (i + 1u) < results->scheduler_case_count ? "," : "");
+    }
+
+    printf("  ]\n");
     printf("}\n");
 }
 
@@ -244,7 +702,7 @@ static void bench_print_results(
 {
     switch (opts->output_format) {
         case BENCH_OUTPUT_CSV:
-            bench_print_results_csv(opts, results, stats);
+            bench_print_results_csv(opts, results);
             break;
         case BENCH_OUTPUT_JSON:
             bench_print_results_json(opts, results, stats);
@@ -256,153 +714,46 @@ static void bench_print_results(
     }
 }
 
-#define BENCH_REQUIRE_STATUS(call_expr)                                                        \
-    do {                                                                                        \
-        lt_status_t bench_status_result = (call_expr);                                          \
-        if (bench_status_result != LT_STATUS_OK) {                                              \
-            fprintf(stderr, "Error: %s failed with %s\n", #call_expr,                         \
-                    lt_status_string(bench_status_result));                                     \
-            return 1;                                                                           \
-        }                                                                                       \
-    } while (0)
-
 int main(int argc, char** argv)
 {
+    const uint32_t worker_sweep[BENCH_SWEEP_WORKER_COUNT] = { 1u, 2u, 4u, 8u };
     bench_options_t opts;
-    lt_world_t* world;
-    lt_component_desc_t desc;
-    lt_component_id_t position_id;
-    lt_component_id_t velocity_id;
-    lt_query_term_t terms[2];
-    lt_query_desc_t query_desc;
-    lt_query_t* query;
-    lt_world_stats_t stats;
-    uint32_t random_state;
-    uint64_t spawn_start_ns;
-    uint64_t spawn_end_ns;
-    uint64_t sim_start_ns;
-    uint64_t sim_end_ns;
-    uint32_t i;
-    uint32_t frame;
-    uint64_t touched_entities;
-    double checksum;
-    double sim_seconds;
     bench_results_t results;
+    lt_world_stats_t baseline_stats;
+    double serial_simulate_ms;
+    uint32_t i;
 
     if (bench_parse_options(argc, argv, &opts) != 0) {
         bench_print_usage(argv[0]);
         return 1;
     }
 
-    BENCH_REQUIRE_STATUS(lt_world_create(NULL, &world));
+    memset(&results, 0, sizeof(results));
+    results.scheduler_case_count = BENCH_SWEEP_WORKER_COUNT;
 
-    memset(&desc, 0, sizeof(desc));
-    desc.name = "Position";
-    desc.size = (uint32_t)sizeof(bench_vec3_t);
-    desc.align = (uint32_t)_Alignof(bench_vec3_t);
-    BENCH_REQUIRE_STATUS(lt_register_component(world, &desc, &position_id));
-
-    desc.name = "Velocity";
-    BENCH_REQUIRE_STATUS(lt_register_component(world, &desc, &velocity_id));
-
-    BENCH_REQUIRE_STATUS(lt_world_reserve_entities(world, opts.entity_count));
-
-    random_state = opts.seed;
-    spawn_start_ns = bench_now_ns();
-
-    if (opts.use_defer != 0u) {
-        BENCH_REQUIRE_STATUS(lt_world_begin_defer(world));
-    }
-
-    for (i = 0u; i < opts.entity_count; ++i) {
-        lt_entity_t entity;
-        bench_vec3_t position;
-        bench_vec3_t velocity;
-
-        BENCH_REQUIRE_STATUS(lt_entity_create(world, &entity));
-
-        position.x = bench_rand_range(&random_state, -100.0f, 100.0f);
-        position.y = bench_rand_range(&random_state, -100.0f, 100.0f);
-        position.z = bench_rand_range(&random_state, -100.0f, 100.0f);
-
-        velocity.x = bench_rand_range(&random_state, -2.0f, 2.0f);
-        velocity.y = bench_rand_range(&random_state, -2.0f, 2.0f);
-        velocity.z = bench_rand_range(&random_state, -2.0f, 2.0f);
-
-        BENCH_REQUIRE_STATUS(lt_add_component(world, entity, position_id, &position));
-        BENCH_REQUIRE_STATUS(lt_add_component(world, entity, velocity_id, &velocity));
-    }
-
-    if (opts.use_defer != 0u) {
-        BENCH_REQUIRE_STATUS(lt_world_end_defer(world));
-        BENCH_REQUIRE_STATUS(lt_world_flush(world));
-    }
-
-    spawn_end_ns = bench_now_ns();
-
-    memset(terms, 0, sizeof(terms));
-    terms[0].component_id = position_id;
-    terms[0].access = LT_ACCESS_WRITE;
-    terms[1].component_id = velocity_id;
-    terms[1].access = LT_ACCESS_READ;
-
-    memset(&query_desc, 0, sizeof(query_desc));
-    query_desc.with_terms = terms;
-    query_desc.with_count = 2u;
-
-    BENCH_REQUIRE_STATUS(lt_query_create(world, &query_desc, &query));
-
-    sim_start_ns = bench_now_ns();
-    touched_entities = 0u;
-    checksum = 0.0;
-
-    for (frame = 0u; frame < opts.frame_count; ++frame) {
-        lt_query_iter_t iter;
-        lt_chunk_view_t view;
-        uint8_t has_value;
-
-        BENCH_REQUIRE_STATUS(lt_query_iter_begin(query, &iter));
-
-        while (1) {
-            uint32_t row;
-            bench_vec3_t* position_col;
-            bench_vec3_t* velocity_col;
-
-            BENCH_REQUIRE_STATUS(lt_query_iter_next(&iter, &view, &has_value));
-            if (has_value == 0u) {
-                break;
-            }
-
-            position_col = (bench_vec3_t*)view.columns[0];
-            velocity_col = (bench_vec3_t*)view.columns[1];
-
-            for (row = 0u; row < view.count; ++row) {
-                position_col[row].x += velocity_col[row].x * (1.0f / 60.0f);
-                position_col[row].y += velocity_col[row].y * (1.0f / 60.0f);
-                position_col[row].z += velocity_col[row].z * (1.0f / 60.0f);
-                checksum += (double)position_col[row].x;
-            }
-
-            touched_entities += (uint64_t)view.count;
+    for (i = 0u; i < BENCH_SWEEP_WORKER_COUNT; ++i) {
+        if (bench_run_scheduler_case(&opts, worker_sweep[i], &results.scheduler_cases[i]) != 0) {
+            return 1;
         }
     }
 
-    sim_end_ns = bench_now_ns();
-    sim_seconds = (double)(sim_end_ns - sim_start_ns) / 1000000000.0;
+    serial_simulate_ms = results.scheduler_cases[0].simulate_ms;
+    for (i = 0u; i < results.scheduler_case_count; ++i) {
+        if (serial_simulate_ms <= 0.0 || results.scheduler_cases[i].simulate_ms <= 0.0) {
+            results.scheduler_cases[i].speedup_vs_serial = 0.0;
+        } else {
+            results.scheduler_cases[i].speedup_vs_serial =
+                serial_simulate_ms / results.scheduler_cases[i].simulate_ms;
+        }
+    }
 
-    BENCH_REQUIRE_STATUS(lt_world_get_stats(world, &stats));
+    results.spawn_ms = results.scheduler_cases[0].spawn_ms;
+    results.simulate_ms = results.scheduler_cases[0].simulate_ms;
+    results.touched_entities = results.scheduler_cases[0].touched_entities;
+    results.simulate_entities_per_sec = results.scheduler_cases[0].simulate_entities_per_sec;
+    results.checksum = results.scheduler_cases[0].checksum;
+    baseline_stats = results.scheduler_cases[0].stats;
 
-    results.spawn_ms = (double)(spawn_end_ns - spawn_start_ns) / 1000000.0;
-    results.simulate_ms = (double)(sim_end_ns - sim_start_ns) / 1000000.0;
-    results.touched_entities = touched_entities;
-    results.simulate_entities_per_sec = touched_entities == 0u || sim_seconds <= 0.0
-                                            ? 0.0
-                                            : ((double)touched_entities / sim_seconds);
-    results.checksum = checksum;
-
-    bench_print_results(&opts, &results, &stats);
-
-    lt_query_destroy(query);
-    lt_world_destroy(world);
+    bench_print_results(&opts, &results, &baseline_stats);
     return 0;
 }
