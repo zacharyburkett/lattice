@@ -41,7 +41,8 @@ Status: early implementation. Phase 5 diagnostics and benchmark tooling are now 
 - Benchmark app (`lattice_bench`) for throughput and structural-layout snapshots,
   with `--format text|csv|json` output modes, scene selection via
   `--scene steady|churn`, configurable worker sweeps via `--workers N[,N...]`
-  (default `1,2,4,8`), speedup reporting, and scheduler batch/edge plus
+  (default `1,2,4,8`), churn tuning via `--churn-rate` and
+  `--churn-initial-ratio`, speedup reporting, and scheduler batch/edge plus
   structural-operation metrics.
 - Unit tests for lifecycle, registration, structural moves, query filtering,
   deferred command semantics, and trace hook coverage.

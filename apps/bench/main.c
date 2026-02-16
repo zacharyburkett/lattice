@@ -43,6 +43,8 @@ typedef struct bench_options_s {
     uint8_t use_defer;
     bench_output_format_t output_format;
     bench_scene_t scene;
+    double churn_rate;
+    double churn_initial_ratio;
     uint32_t worker_count;
     uint32_t workers[BENCH_SWEEP_WORKER_COUNT_MAX];
 } bench_options_t;
@@ -103,7 +105,8 @@ static void bench_print_usage(const char* program)
     fprintf(
         stderr,
         "Usage: %s [--entities N] [--frames N] [--seed N] [--defer 0|1] "
-        "[--format text|csv|json] [--scene steady|churn] [--workers N[,N...]]\n",
+        "[--format text|csv|json] [--scene steady|churn] [--churn-rate 0..1] "
+        "[--churn-initial-ratio 0..1] [--workers N[,N...]]\n",
         program);
 }
 
@@ -145,6 +148,39 @@ static int bench_parse_output_format(const char* arg, bench_output_format_t* out
     }
 
     return 1;
+}
+
+static int bench_parse_f64(const char* arg, double* out_value)
+{
+    char* end_ptr;
+    double parsed;
+
+    if (arg == NULL || out_value == NULL || arg[0] == '\0') {
+        return 1;
+    }
+
+    parsed = strtod(arg, &end_ptr);
+    if (end_ptr == arg || *end_ptr != '\0' || parsed != parsed) {
+        return 1;
+    }
+
+    *out_value = parsed;
+    return 0;
+}
+
+static int bench_parse_unit_f64(const char* arg, double* out_value)
+{
+    double parsed;
+
+    if (bench_parse_f64(arg, &parsed) != 0) {
+        return 1;
+    }
+    if (parsed < 0.0 || parsed > 1.0) {
+        return 1;
+    }
+
+    *out_value = parsed;
+    return 0;
 }
 
 static int bench_parse_scene(const char* arg, bench_scene_t* out_scene)
@@ -230,6 +266,8 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
     out_opts->use_defer = 1u;
     out_opts->output_format = BENCH_OUTPUT_TEXT;
     out_opts->scene = BENCH_SCENE_STEADY;
+    out_opts->churn_rate = 0.125;
+    out_opts->churn_initial_ratio = 0.5;
     out_opts->worker_count = BENCH_SWEEP_WORKER_COUNT_DEFAULT;
     out_opts->workers[0] = 1u;
     out_opts->workers[1] = 2u;
@@ -267,6 +305,17 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
             i += 1;
         } else if (strcmp(argv[i], "--scene") == 0) {
             if (i + 1 >= argc || bench_parse_scene(argv[i + 1], &out_opts->scene) != 0) {
+                return 1;
+            }
+            i += 1;
+        } else if (strcmp(argv[i], "--churn-rate") == 0) {
+            if (i + 1 >= argc || bench_parse_unit_f64(argv[i + 1], &out_opts->churn_rate) != 0) {
+                return 1;
+            }
+            i += 1;
+        } else if (strcmp(argv[i], "--churn-initial-ratio") == 0) {
+            if (i + 1 >= argc
+                || bench_parse_unit_f64(argv[i + 1], &out_opts->churn_initial_ratio) != 0) {
                 return 1;
             }
             i += 1;
@@ -584,6 +633,8 @@ static int bench_run_scheduler_case(
     BENCH_CASE_REQUIRE_STATUS(lt_world_reserve_entities(world, opts->entity_count));
 
     if (opts->scene == BENCH_SCENE_CHURN && opts->entity_count > 0u) {
+        double raw_toggle_count;
+
         tracked_entities = (lt_entity_t*)malloc(sizeof(*tracked_entities) * (size_t)opts->entity_count);
         has_churn = (uint8_t*)malloc(sizeof(*has_churn) * (size_t)opts->entity_count);
         if (tracked_entities == NULL || has_churn == NULL) {
@@ -591,9 +642,15 @@ static int bench_run_scheduler_case(
             goto cleanup;
         }
         memset(has_churn, 0, sizeof(*has_churn) * (size_t)opts->entity_count);
-        toggle_count_per_frame = opts->entity_count / 8u;
-        if (toggle_count_per_frame == 0u) {
-            toggle_count_per_frame = 1u;
+
+        raw_toggle_count = (double)opts->entity_count * opts->churn_rate;
+        if (raw_toggle_count >= (double)opts->entity_count) {
+            toggle_count_per_frame = opts->entity_count;
+        } else {
+            toggle_count_per_frame = (uint32_t)raw_toggle_count;
+            if (opts->churn_rate > 0.0 && toggle_count_per_frame == 0u) {
+                toggle_count_per_frame = 1u;
+            }
         }
     }
 
@@ -629,7 +686,9 @@ static int bench_run_scheduler_case(
 
         if (opts->scene == BENCH_SCENE_CHURN) {
             tracked_entities[i] = entity;
-            if ((i & 1u) == 0u) {
+            if (opts->churn_initial_ratio >= 1.0
+                || (opts->churn_initial_ratio > 0.0
+                    && bench_rand_range(&random_state, 0.0f, 1.0f) < (float)opts->churn_initial_ratio)) {
                 churn.resistance = bench_rand_range(&random_state, 0.1f, 2.0f);
                 BENCH_CASE_REQUIRE_STATUS(lt_add_component(world, entity, churn_id, &churn));
                 has_churn[i] = 1u;
@@ -717,7 +776,8 @@ static int bench_run_scheduler_case(
             out_case->schedule_stats = frame_stats;
         }
 
-        if (opts->scene == BENCH_SCENE_CHURN && opts->entity_count > 0u) {
+        if (opts->scene == BENCH_SCENE_CHURN && opts->entity_count > 0u
+            && toggle_count_per_frame > 0u) {
             uint32_t base;
             uint32_t op;
 
@@ -819,6 +879,8 @@ static void bench_print_results_text(
     printf("seed=%" PRIu32 "\n", opts->seed);
     printf("defer=%" PRIu32 "\n", (uint32_t)opts->use_defer);
     printf("scene=%s\n", bench_scene_name(opts->scene));
+    printf("churn_rate=%.6f\n", opts->churn_rate);
+    printf("churn_initial_ratio=%.6f\n", opts->churn_initial_ratio);
     printf("spawn_ms=%.3f\n", results->spawn_ms);
     printf("simulate_ms=%.3f\n", results->simulate_ms);
     printf("touched_entities=%" PRIu64 "\n", results->touched_entities);
@@ -866,7 +928,8 @@ static void bench_print_results_csv(const bench_options_t* opts, const bench_res
         "entities,frames,seed,defer,workers,spawn_ms,simulate_ms,speedup_vs_serial,"
         "touched_entities,simulate_entities_per_sec,checksum,stats_live,stats_archetypes,"
         "stats_chunks,stats_pending,stats_structural_moves,schedule_batch_count,"
-        "schedule_edge_count,schedule_max_batch_size,scheduler_structural_ops,scene\n");
+        "schedule_edge_count,schedule_max_batch_size,scheduler_structural_ops,scene,"
+        "churn_rate,churn_initial_ratio\n");
 
     for (i = 0u; i < results->scheduler_case_count; ++i) {
         const bench_scheduler_case_t* c;
@@ -875,7 +938,7 @@ static void bench_print_results_csv(const bench_options_t* opts, const bench_res
         printf(
             "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ","
             "%.3f,%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,%" PRIu32 ",%" PRIu32 ",%" PRIu32
-            ",%" PRIu32 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu64 ",%s\n",
+            ",%" PRIu32 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu64 ",%s,%.6f,%.6f\n",
             opts->entity_count,
             opts->frame_count,
             opts->seed,
@@ -896,7 +959,9 @@ static void bench_print_results_csv(const bench_options_t* opts, const bench_res
             c->schedule_stats.edge_count,
             c->schedule_stats.max_batch_size,
             c->structural_ops,
-            bench_scene_name(opts->scene));
+            bench_scene_name(opts->scene),
+            opts->churn_rate,
+            opts->churn_initial_ratio);
     }
 }
 
@@ -913,6 +978,8 @@ static void bench_print_results_json(
     printf("  \"seed\": %" PRIu32 ",\n", opts->seed);
     printf("  \"defer\": %s,\n", opts->use_defer != 0u ? "true" : "false");
     printf("  \"scene\": \"%s\",\n", bench_scene_name(opts->scene));
+    printf("  \"churn_rate\": %.6f,\n", opts->churn_rate);
+    printf("  \"churn_initial_ratio\": %.6f,\n", opts->churn_initial_ratio);
     printf("  \"spawn_ms\": %.3f,\n", results->spawn_ms);
     printf("  \"simulate_ms\": %.3f,\n", results->simulate_ms);
     printf("  \"touched_entities\": %" PRIu64 ",\n", results->touched_entities);

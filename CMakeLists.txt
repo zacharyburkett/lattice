@@ -93,6 +93,8 @@ if(LATTICE_BUILD_BENCHMARKS)
                 -DBENCH_EXE=$<TARGET_FILE:lattice_bench>
                 -DMODE=text
                 -DSCENE=churn
+                -DCHURN_RATE=0.200000
+                -DCHURN_INITIAL_RATIO=0.300000
                 -DWORKERS=1,2
                 -DEXPECTED_WORKERS=1,2
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
