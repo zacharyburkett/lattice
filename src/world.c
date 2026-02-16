@@ -2589,19 +2589,35 @@ lt_status_t lt_query_refresh(lt_query_t* query)
 
 lt_status_t lt_query_iter_begin(lt_query_t* query, lt_query_iter_t* out_iter)
 {
+    lt_world_t* world;
     lt_status_t status;
 
-    if (query == NULL || out_iter == NULL) {
+    if (query == NULL || out_iter == NULL || query->world == NULL) {
         return LT_STATUS_INVALID_ARGUMENT;
     }
+    world = query->world;
 
     status = lt_query_refresh(query);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_QUERY_ITER_BEGIN,
+            status,
+            LT_ENTITY_NULL,
+            LT_COMPONENT_INVALID,
+            query->match_count);
         return status;
     }
 
     status = lt_query_ensure_scratch_capacity(query, query->with_count);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_QUERY_ITER_BEGIN,
+            status,
+            LT_ENTITY_NULL,
+            LT_COMPONENT_INVALID,
+            query->match_count);
         return status;
     }
 
@@ -2611,6 +2627,14 @@ lt_status_t lt_query_iter_begin(lt_query_t* query, lt_query_iter_t* out_iter)
     out_iter->chunk_cursor = NULL;
     out_iter->columns = query->scratch_columns;
     out_iter->column_capacity = query->scratch_capacity;
+    out_iter->finished = 0u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_QUERY_ITER_BEGIN,
+        LT_STATUS_OK,
+        LT_ENTITY_NULL,
+        LT_COMPONENT_INVALID,
+        query->match_count);
     return LT_STATUS_OK;
 }
 
@@ -2641,7 +2665,18 @@ lt_status_t lt_query_iter_next(
 
     status = lt_query_ensure_scratch_capacity(query, query->with_count);
     if (status != LT_STATUS_OK) {
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_QUERY_ITER_END,
+            status,
+            LT_ENTITY_NULL,
+            LT_COMPONENT_INVALID,
+            query->match_count);
         return status;
+    }
+
+    if (iter->finished != 0u) {
+        return LT_STATUS_OK;
     }
 
     while (iter->archetype_index < query->match_count) {
@@ -2674,6 +2709,14 @@ lt_status_t lt_query_iter_next(
                 query->with_terms[i].component_id,
                 &component_index);
             if (!found) {
+                iter->finished = 1u;
+                lt_trace_emit(
+                    world,
+                    LT_TRACE_EVENT_QUERY_ITER_END,
+                    LT_STATUS_CONFLICT,
+                    LT_ENTITY_NULL,
+                    LT_COMPONENT_INVALID,
+                    query->match_count);
                 return LT_STATUS_CONFLICT;
             }
 
@@ -2693,13 +2736,29 @@ lt_status_t lt_query_iter_next(
 
         iter->columns = query->scratch_columns;
         iter->column_capacity = query->scratch_capacity;
+        iter->finished = 0u;
         iter->chunk_cursor = chunk->next;
         if (iter->chunk_cursor == NULL) {
             iter->archetype_index += 1u;
         }
+        lt_trace_emit(
+            world,
+            LT_TRACE_EVENT_QUERY_ITER_CHUNK,
+            LT_STATUS_OK,
+            LT_ENTITY_NULL,
+            LT_COMPONENT_INVALID,
+            out_view->count);
         return LT_STATUS_OK;
     }
 
+    iter->finished = 1u;
+    lt_trace_emit(
+        world,
+        LT_TRACE_EVENT_QUERY_ITER_END,
+        LT_STATUS_OK,
+        LT_ENTITY_NULL,
+        LT_COMPONENT_INVALID,
+        query->match_count);
     return LT_STATUS_OK;
 }
 

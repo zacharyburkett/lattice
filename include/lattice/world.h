@@ -72,7 +72,10 @@ typedef enum lt_trace_event_kind_e {
     LT_TRACE_EVENT_ENTITY_CREATE = 7,
     LT_TRACE_EVENT_ENTITY_DESTROY = 8,
     LT_TRACE_EVENT_COMPONENT_ADD = 9,
-    LT_TRACE_EVENT_COMPONENT_REMOVE = 10
+    LT_TRACE_EVENT_COMPONENT_REMOVE = 10,
+    LT_TRACE_EVENT_QUERY_ITER_BEGIN = 11,
+    LT_TRACE_EVENT_QUERY_ITER_CHUNK = 12,
+    LT_TRACE_EVENT_QUERY_ITER_END = 13
 } lt_trace_event_kind_t;
 
 typedef struct lt_trace_event_s {
@@ -118,6 +121,7 @@ typedef struct lt_query_iter_s {
     void* chunk_cursor;
     void** columns;
     uint32_t column_capacity;
+    uint8_t finished;
 } lt_query_iter_t;
 
 lt_status_t lt_world_create(const lt_world_config_t* cfg, lt_world_t** out_world);

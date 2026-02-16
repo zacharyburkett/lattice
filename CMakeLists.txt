@@ -55,5 +55,13 @@ if(LATTICE_BUILD_BENCHMARKS)
             NAME lattice_bench_smoke
             COMMAND lattice_bench --entities 10000 --frames 5 --seed 7
         )
+        add_test(
+            NAME lattice_bench_smoke_csv
+            COMMAND lattice_bench --entities 10000 --frames 5 --seed 7 --format csv
+        )
+        add_test(
+            NAME lattice_bench_smoke_json
+            COMMAND lattice_bench --entities 10000 --frames 5 --seed 7 --format json
+        )
     endif()
 endif()

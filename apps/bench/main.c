@@ -12,12 +12,27 @@ typedef struct bench_vec3_s {
     float z;
 } bench_vec3_t;
 
+typedef enum bench_output_format_e {
+    BENCH_OUTPUT_TEXT = 0,
+    BENCH_OUTPUT_CSV = 1,
+    BENCH_OUTPUT_JSON = 2
+} bench_output_format_t;
+
 typedef struct bench_options_s {
     uint32_t entity_count;
     uint32_t frame_count;
     uint32_t seed;
     uint8_t use_defer;
+    bench_output_format_t output_format;
 } bench_options_t;
+
+typedef struct bench_results_s {
+    double spawn_ms;
+    double simulate_ms;
+    double simulate_entities_per_sec;
+    uint64_t touched_entities;
+    double checksum;
+} bench_results_t;
 
 static uint64_t bench_now_ns(void)
 {
@@ -34,7 +49,7 @@ static void bench_print_usage(const char* program)
 {
     fprintf(
         stderr,
-        "Usage: %s [--entities N] [--frames N] [--seed N] [--defer 0|1]\n",
+        "Usage: %s [--entities N] [--frames N] [--seed N] [--defer 0|1] [--format text|csv|json]\n",
         program);
 }
 
@@ -56,6 +71,28 @@ static int bench_parse_u32(const char* arg, uint32_t* out_value)
     return 0;
 }
 
+static int bench_parse_output_format(const char* arg, bench_output_format_t* out_format)
+{
+    if (arg == NULL || out_format == NULL) {
+        return 1;
+    }
+
+    if (strcmp(arg, "text") == 0) {
+        *out_format = BENCH_OUTPUT_TEXT;
+        return 0;
+    }
+    if (strcmp(arg, "csv") == 0) {
+        *out_format = BENCH_OUTPUT_CSV;
+        return 0;
+    }
+    if (strcmp(arg, "json") == 0) {
+        *out_format = BENCH_OUTPUT_JSON;
+        return 0;
+    }
+
+    return 1;
+}
+
 static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
 {
     int i;
@@ -69,6 +106,7 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
     out_opts->frame_count = 120u;
     out_opts->seed = 1337u;
     out_opts->use_defer = 1u;
+    out_opts->output_format = BENCH_OUTPUT_TEXT;
 
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--entities") == 0) {
@@ -92,6 +130,12 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
                 return 1;
             }
             out_opts->use_defer = (uint8_t)defer_value;
+            i += 1;
+        } else if (strcmp(argv[i], "--format") == 0) {
+            if (i + 1 >= argc
+                || bench_parse_output_format(argv[i + 1], &out_opts->output_format) != 0) {
+                return 1;
+            }
             i += 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             return 1;
@@ -117,6 +161,96 @@ static float bench_rand_range(uint32_t* state, float min_value, float max_value)
     r = bench_rand_u32(state);
     t = (float)(r >> 8) / (float)0x00FFFFFFu;
     return min_value + (max_value - min_value) * t;
+}
+
+static void bench_print_results_text(
+    const bench_options_t* opts,
+    const bench_results_t* results,
+    const lt_world_stats_t* stats)
+{
+    printf("entities=%" PRIu32 "\n", opts->entity_count);
+    printf("frames=%" PRIu32 "\n", opts->frame_count);
+    printf("seed=%" PRIu32 "\n", opts->seed);
+    printf("defer=%" PRIu32 "\n", (uint32_t)opts->use_defer);
+    printf("spawn_ms=%.3f\n", results->spawn_ms);
+    printf("simulate_ms=%.3f\n", results->simulate_ms);
+    printf("touched_entities=%" PRIu64 "\n", results->touched_entities);
+    printf("simulate_entities_per_sec=%.3f\n", results->simulate_entities_per_sec);
+    printf("checksum=%.6f\n", results->checksum);
+    printf(
+        "stats_live=%" PRIu32 " stats_archetypes=%" PRIu32 " stats_chunks=%" PRIu32
+        " stats_pending=%" PRIu32 "\n",
+        stats->live_entities,
+        stats->archetype_count,
+        stats->chunk_count,
+        stats->pending_commands);
+}
+
+static void bench_print_results_csv(
+    const bench_options_t* opts,
+    const bench_results_t* results,
+    const lt_world_stats_t* stats)
+{
+    printf(
+        "entities,frames,seed,defer,spawn_ms,simulate_ms,touched_entities,simulate_entities_per_sec,checksum,"
+        "stats_live,stats_archetypes,stats_chunks,stats_pending\n");
+    printf(
+        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%.3f,%.3f,%" PRIu64 ",%.3f,%.6f,"
+        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
+        opts->entity_count,
+        opts->frame_count,
+        opts->seed,
+        (uint32_t)opts->use_defer,
+        results->spawn_ms,
+        results->simulate_ms,
+        results->touched_entities,
+        results->simulate_entities_per_sec,
+        results->checksum,
+        stats->live_entities,
+        stats->archetype_count,
+        stats->chunk_count,
+        stats->pending_commands);
+}
+
+static void bench_print_results_json(
+    const bench_options_t* opts,
+    const bench_results_t* results,
+    const lt_world_stats_t* stats)
+{
+    printf("{\n");
+    printf("  \"entities\": %" PRIu32 ",\n", opts->entity_count);
+    printf("  \"frames\": %" PRIu32 ",\n", opts->frame_count);
+    printf("  \"seed\": %" PRIu32 ",\n", opts->seed);
+    printf("  \"defer\": %s,\n", opts->use_defer != 0u ? "true" : "false");
+    printf("  \"spawn_ms\": %.3f,\n", results->spawn_ms);
+    printf("  \"simulate_ms\": %.3f,\n", results->simulate_ms);
+    printf("  \"touched_entities\": %" PRIu64 ",\n", results->touched_entities);
+    printf("  \"simulate_entities_per_sec\": %.3f,\n", results->simulate_entities_per_sec);
+    printf("  \"checksum\": %.6f,\n", results->checksum);
+    printf("  \"stats_live\": %" PRIu32 ",\n", stats->live_entities);
+    printf("  \"stats_archetypes\": %" PRIu32 ",\n", stats->archetype_count);
+    printf("  \"stats_chunks\": %" PRIu32 ",\n", stats->chunk_count);
+    printf("  \"stats_pending\": %" PRIu32 "\n", stats->pending_commands);
+    printf("}\n");
+}
+
+static void bench_print_results(
+    const bench_options_t* opts,
+    const bench_results_t* results,
+    const lt_world_stats_t* stats)
+{
+    switch (opts->output_format) {
+        case BENCH_OUTPUT_CSV:
+            bench_print_results_csv(opts, results, stats);
+            break;
+        case BENCH_OUTPUT_JSON:
+            bench_print_results_json(opts, results, stats);
+            break;
+        case BENCH_OUTPUT_TEXT:
+        default:
+            bench_print_results_text(opts, results, stats);
+            break;
+    }
 }
 
 #define BENCH_REQUIRE_STATUS(call_expr)                                                        \
@@ -150,6 +284,7 @@ int main(int argc, char** argv)
     uint64_t touched_entities;
     double checksum;
     double sim_seconds;
+    bench_results_t results;
 
     if (bench_parse_options(argc, argv, &opts) != 0) {
         bench_print_usage(argv[0]);
@@ -254,24 +389,15 @@ int main(int argc, char** argv)
 
     BENCH_REQUIRE_STATUS(lt_world_get_stats(world, &stats));
 
-    printf("entities=%" PRIu32 "\n", opts.entity_count);
-    printf("frames=%" PRIu32 "\n", opts.frame_count);
-    printf("defer=%" PRIu32 "\n", (uint32_t)opts.use_defer);
-    printf("spawn_ms=%.3f\n", (double)(spawn_end_ns - spawn_start_ns) / 1000000.0);
-    printf("simulate_ms=%.3f\n", (double)(sim_end_ns - sim_start_ns) / 1000000.0);
-    printf(
-        "simulate_entities_per_sec=%.3f\n",
-        touched_entities == 0u || sim_seconds <= 0.0
-            ? 0.0
-            : ((double)touched_entities / sim_seconds));
-    printf("checksum=%.6f\n", checksum);
-    printf(
-        "stats_live=%" PRIu32 " stats_archetypes=%" PRIu32 " stats_chunks=%" PRIu32
-        " stats_pending=%" PRIu32 "\n",
-        stats.live_entities,
-        stats.archetype_count,
-        stats.chunk_count,
-        stats.pending_commands);
+    results.spawn_ms = (double)(spawn_end_ns - spawn_start_ns) / 1000000.0;
+    results.simulate_ms = (double)(sim_end_ns - sim_start_ns) / 1000000.0;
+    results.touched_entities = touched_entities;
+    results.simulate_entities_per_sec = touched_entities == 0u || sim_seconds <= 0.0
+                                            ? 0.0
+                                            : ((double)touched_entities / sim_seconds);
+    results.checksum = checksum;
+
+    bench_print_results(&opts, &results, &stats);
 
     lt_query_destroy(query);
     lt_world_destroy(world);

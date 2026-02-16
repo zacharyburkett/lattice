@@ -31,9 +31,11 @@ Status: early implementation. Phase 5 diagnostics and benchmark tooling are now 
 - Query API for archetype-matched chunk iteration (`lt_query_*`).
 - Deferred structural command buffer (`lt_world_begin_defer`,
   `lt_world_end_defer`, `lt_world_flush`).
-- Trace hook diagnostics for runtime event capture (`lt_world_set_trace_hook`).
+- Trace hook diagnostics for runtime event capture (`lt_world_set_trace_hook`),
+  including query iteration begin/chunk/end events.
 - World stats snapshot API.
-- Benchmark app (`lattice_bench`) for throughput and structural-layout snapshots.
+- Benchmark app (`lattice_bench`) for throughput and structural-layout snapshots,
+  with `--format text|csv|json` output modes.
 - Unit tests for lifecycle, registration, structural moves, query filtering,
   deferred command semantics, and trace hook coverage.
 

@@ -50,6 +50,9 @@ typedef struct test_trace_capture_s {
     uint32_t entity_destroy_count;
     uint32_t component_add_count;
     uint32_t component_remove_count;
+    uint32_t query_begin_count;
+    uint32_t query_chunk_count;
+    uint32_t query_end_count;
     lt_status_t last_status;
     lt_trace_event_kind_t last_kind;
 } test_trace_capture_t;
@@ -115,6 +118,15 @@ static void test_trace_hook(const lt_trace_event_t* event, void* user_data)
             break;
         case LT_TRACE_EVENT_COMPONENT_REMOVE:
             capture->component_remove_count += 1u;
+            break;
+        case LT_TRACE_EVENT_QUERY_ITER_BEGIN:
+            capture->query_begin_count += 1u;
+            break;
+        case LT_TRACE_EVENT_QUERY_ITER_CHUNK:
+            capture->query_chunk_count += 1u;
+            break;
+        case LT_TRACE_EVENT_QUERY_ITER_END:
+            capture->query_end_count += 1u;
             break;
         default:
             break;
@@ -818,6 +830,75 @@ static int test_trace_hook_reports_core_events(void)
     return 0;
 }
 
+static int test_trace_hook_reports_query_events(void)
+{
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_entity_t entity;
+    test_vec3_t position;
+    test_vec3_t velocity;
+    lt_query_term_t terms[2];
+    lt_query_desc_t query_desc;
+    lt_query_t* query;
+    lt_query_iter_t iter;
+    lt_chunk_view_t view;
+    uint8_t has_value;
+    test_trace_capture_t capture;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    memset(&capture, 0, sizeof(capture));
+    ASSERT_STATUS(lt_world_set_trace_hook(world, test_trace_hook, &capture), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+    position.x = 1.0f;
+    position.y = 2.0f;
+    position.z = 3.0f;
+    velocity.x = 0.25f;
+    velocity.y = 0.5f;
+    velocity.z = 0.75f;
+
+    ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, entity, velocity_id, &velocity), LT_STATUS_OK);
+
+    memset(terms, 0, sizeof(terms));
+    terms[0].component_id = position_id;
+    terms[0].access = LT_ACCESS_WRITE;
+    terms[1].component_id = velocity_id;
+    terms[1].access = LT_ACCESS_READ;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = terms;
+    query_desc.with_count = 2u;
+
+    ASSERT_STATUS(lt_query_create(world, &query_desc, &query), LT_STATUS_OK);
+    ASSERT_STATUS(lt_query_iter_begin(query, &iter), LT_STATUS_OK);
+
+    while (1) {
+        ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+        if (has_value == 0u) {
+            break;
+        }
+        ASSERT_TRUE(view.count > 0u);
+    }
+
+    ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+    ASSERT_TRUE(has_value == 0u);
+
+    ASSERT_TRUE(capture.query_begin_count == 1u);
+    ASSERT_TRUE(capture.query_chunk_count >= 1u);
+    ASSERT_TRUE(capture.query_end_count == 1u);
+    ASSERT_TRUE(capture.last_kind == LT_TRACE_EVENT_QUERY_ITER_END);
+    ASSERT_TRUE(capture.last_status == LT_STATUS_OK);
+
+    lt_query_destroy(query);
+    lt_world_destroy(world);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_destroy_defaults);
@@ -836,5 +917,6 @@ int main(void)
     RUN_TEST(test_deferred_flush_conflict_and_destroy);
     RUN_TEST(test_deferred_command_ordering);
     RUN_TEST(test_trace_hook_reports_core_events);
+    RUN_TEST(test_trace_hook_reports_query_events);
     return 0;
 }
