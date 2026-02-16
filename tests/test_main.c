@@ -481,6 +481,22 @@ typedef struct test_parallel_step_ctx_s {
     float dt;
 } test_parallel_step_ctx_t;
 
+typedef struct test_health_s {
+    float value;
+} test_health_t;
+
+typedef struct test_schedule_motion_ctx_s {
+    float dt;
+} test_schedule_motion_ctx_t;
+
+typedef struct test_schedule_health_ctx_s {
+    float drain;
+} test_schedule_health_ctx_t;
+
+typedef struct test_schedule_damp_ctx_s {
+    float factor;
+} test_schedule_damp_ctx_t;
+
 static void test_parallel_integrate_chunk(
     const lt_chunk_view_t* view,
     uint32_t worker_index,
@@ -505,6 +521,78 @@ static void test_parallel_integrate_chunk(
         position_col[row].x += velocity_col[row].x * step_ctx->dt;
         position_col[row].y += velocity_col[row].y * step_ctx->dt;
         position_col[row].z += velocity_col[row].z * step_ctx->dt;
+    }
+}
+
+static void test_schedule_motion_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    test_schedule_motion_ctx_t* ctx;
+    test_vec3_t* position_col;
+    test_vec3_t* velocity_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 2u) {
+        return;
+    }
+
+    ctx = (test_schedule_motion_ctx_t*)user_data;
+    position_col = (test_vec3_t*)view->columns[0];
+    velocity_col = (test_vec3_t*)view->columns[1];
+    for (row = 0u; row < view->count; ++row) {
+        position_col[row].x += velocity_col[row].x * ctx->dt;
+        position_col[row].y += velocity_col[row].y * ctx->dt;
+        position_col[row].z += velocity_col[row].z * ctx->dt;
+    }
+}
+
+static void test_schedule_health_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    test_schedule_health_ctx_t* ctx;
+    test_health_t* health_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 1u) {
+        return;
+    }
+
+    ctx = (test_schedule_health_ctx_t*)user_data;
+    health_col = (test_health_t*)view->columns[0];
+    for (row = 0u; row < view->count; ++row) {
+        health_col[row].value -= ctx->drain;
+    }
+}
+
+static void test_schedule_damp_chunk(
+    const lt_chunk_view_t* view,
+    uint32_t worker_index,
+    void* user_data)
+{
+    test_schedule_damp_ctx_t* ctx;
+    test_vec3_t* velocity_col;
+    uint32_t row;
+
+    (void)worker_index;
+
+    if (view == NULL || user_data == NULL || view->columns == NULL || view->column_count < 1u) {
+        return;
+    }
+
+    ctx = (test_schedule_damp_ctx_t*)user_data;
+    velocity_col = (test_vec3_t*)view->columns[0];
+    for (row = 0u; row < view->count; ++row) {
+        velocity_col[row].x *= ctx->factor;
+        velocity_col[row].y *= ctx->factor;
+        velocity_col[row].z *= ctx->factor;
     }
 }
 
@@ -602,6 +690,187 @@ static int run_parallel_query_simulation(
     out_snapshot->tracked_alive_count = out_snapshot->stats.live_entities;
 
     lt_query_destroy(query);
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int run_schedule_simulation(
+    uint32_t seed,
+    uint32_t worker_count,
+    test_determinism_snapshot_t* out_snapshot,
+    lt_query_schedule_stats_t* out_schedule_stats)
+{
+    enum {
+        ENTITY_COUNT = 192u,
+        FRAME_COUNT = 30u
+    };
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_component_id_t health_id;
+    lt_component_desc_t health_desc;
+    lt_query_term_t motion_terms[2];
+    lt_query_term_t health_terms[1];
+    lt_query_term_t damp_terms[1];
+    lt_query_term_t sum_terms[3];
+    lt_query_desc_t motion_desc;
+    lt_query_desc_t health_desc_query;
+    lt_query_desc_t damp_desc;
+    lt_query_desc_t sum_desc;
+    lt_query_t* motion_query;
+    lt_query_t* health_query;
+    lt_query_t* damp_query;
+    lt_query_t* sum_query;
+    lt_query_schedule_entry_t entries[3];
+    test_schedule_motion_ctx_t motion_ctx;
+    test_schedule_health_ctx_t health_ctx;
+    test_schedule_damp_ctx_t damp_ctx;
+    uint32_t rng;
+    uint32_t i;
+    uint32_t frame;
+
+    ASSERT_TRUE(out_snapshot != NULL);
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    if (out_schedule_stats != NULL) {
+        memset(out_schedule_stats, 0, sizeof(*out_schedule_stats));
+    }
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    memset(&health_desc, 0, sizeof(health_desc));
+    health_desc.name = "Health";
+    health_desc.size = (uint32_t)sizeof(test_health_t);
+    health_desc.align = (uint32_t)_Alignof(test_health_t);
+    ASSERT_STATUS(lt_register_component(world, &health_desc, &health_id), LT_STATUS_OK);
+
+    memset(motion_terms, 0, sizeof(motion_terms));
+    motion_terms[0].component_id = position_id;
+    motion_terms[0].access = LT_ACCESS_WRITE;
+    motion_terms[1].component_id = velocity_id;
+    motion_terms[1].access = LT_ACCESS_READ;
+    memset(&motion_desc, 0, sizeof(motion_desc));
+    motion_desc.with_terms = motion_terms;
+    motion_desc.with_count = 2u;
+    ASSERT_STATUS(lt_query_create(world, &motion_desc, &motion_query), LT_STATUS_OK);
+
+    memset(health_terms, 0, sizeof(health_terms));
+    health_terms[0].component_id = health_id;
+    health_terms[0].access = LT_ACCESS_WRITE;
+    memset(&health_desc_query, 0, sizeof(health_desc_query));
+    health_desc_query.with_terms = health_terms;
+    health_desc_query.with_count = 1u;
+    ASSERT_STATUS(lt_query_create(world, &health_desc_query, &health_query), LT_STATUS_OK);
+
+    memset(damp_terms, 0, sizeof(damp_terms));
+    damp_terms[0].component_id = velocity_id;
+    damp_terms[0].access = LT_ACCESS_WRITE;
+    memset(&damp_desc, 0, sizeof(damp_desc));
+    damp_desc.with_terms = damp_terms;
+    damp_desc.with_count = 1u;
+    ASSERT_STATUS(lt_query_create(world, &damp_desc, &damp_query), LT_STATUS_OK);
+
+    entries[0].query = motion_query;
+    entries[0].callback = test_schedule_motion_chunk;
+    entries[0].user_data = &motion_ctx;
+    entries[1].query = health_query;
+    entries[1].callback = test_schedule_health_chunk;
+    entries[1].user_data = &health_ctx;
+    entries[2].query = damp_query;
+    entries[2].callback = test_schedule_damp_chunk;
+    entries[2].user_data = &damp_ctx;
+
+    motion_ctx.dt = 1.0f / 60.0f;
+    health_ctx.drain = 0.05f;
+    damp_ctx.factor = 0.999f;
+
+    rng = seed;
+    for (i = 0u; i < ENTITY_COUNT; ++i) {
+        lt_entity_t entity;
+        test_vec3_t position;
+        test_vec3_t velocity;
+        test_health_t health;
+
+        ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+        position.x = test_rand_range(&rng, -150.0f, 150.0f);
+        position.y = test_rand_range(&rng, -150.0f, 150.0f);
+        position.z = test_rand_range(&rng, -150.0f, 150.0f);
+        velocity.x = test_rand_range(&rng, -3.0f, 3.0f);
+        velocity.y = test_rand_range(&rng, -3.0f, 3.0f);
+        velocity.z = test_rand_range(&rng, -3.0f, 3.0f);
+        health.value = 100.0f + test_rand_range(&rng, -25.0f, 25.0f);
+
+        ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+        ASSERT_STATUS(lt_add_component(world, entity, velocity_id, &velocity), LT_STATUS_OK);
+        ASSERT_STATUS(lt_add_component(world, entity, health_id, &health), LT_STATUS_OK);
+    }
+
+    for (frame = 0u; frame < FRAME_COUNT; ++frame) {
+        lt_query_schedule_stats_t frame_stats;
+
+        ASSERT_STATUS(
+            lt_query_schedule_execute(entries, 3u, worker_count, &frame_stats),
+            LT_STATUS_OK);
+        if (frame == 0u && out_schedule_stats != NULL) {
+            *out_schedule_stats = frame_stats;
+        }
+    }
+
+    memset(sum_terms, 0, sizeof(sum_terms));
+    sum_terms[0].component_id = position_id;
+    sum_terms[0].access = LT_ACCESS_READ;
+    sum_terms[1].component_id = velocity_id;
+    sum_terms[1].access = LT_ACCESS_READ;
+    sum_terms[2].component_id = health_id;
+    sum_terms[2].access = LT_ACCESS_READ;
+    memset(&sum_desc, 0, sizeof(sum_desc));
+    sum_desc.with_terms = sum_terms;
+    sum_desc.with_count = 3u;
+    ASSERT_STATUS(lt_query_create(world, &sum_desc, &sum_query), LT_STATUS_OK);
+
+    {
+        lt_query_iter_t iter;
+        lt_chunk_view_t view;
+        uint8_t has_value;
+        uint64_t checksum;
+
+        checksum = 0xcbf29ce484222325ull;
+        ASSERT_STATUS(lt_query_iter_begin(sum_query, &iter), LT_STATUS_OK);
+        while (1) {
+            ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+            if (has_value == 0u) {
+                break;
+            }
+
+            for (i = 0u; i < view.count; ++i) {
+                test_vec3_t* position_col;
+                test_vec3_t* velocity_col;
+                test_health_t* health_col;
+
+                position_col = (test_vec3_t*)view.columns[0];
+                velocity_col = (test_vec3_t*)view.columns[1];
+                health_col = (test_health_t*)view.columns[2];
+                checksum = test_checksum_mix(checksum, (uint64_t)(uint32_t)view.entities[i]);
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].x));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].y));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].z));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(velocity_col[i].x));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(velocity_col[i].y));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(velocity_col[i].z));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(health_col[i].value));
+            }
+        }
+
+        out_snapshot->checksum = checksum;
+    }
+
+    ASSERT_STATUS(lt_world_get_stats(world, &out_snapshot->stats), LT_STATUS_OK);
+    out_snapshot->tracked_alive_count = out_snapshot->stats.live_entities;
+
+    lt_query_destroy(sum_query);
+    lt_query_destroy(damp_query);
+    lt_query_destroy(health_query);
+    lt_query_destroy(motion_query);
     lt_world_destroy(world);
     return 0;
 }
@@ -1474,6 +1743,101 @@ static int test_parallel_query_for_each_chunk_deterministic(void)
     return 0;
 }
 
+static int test_query_schedule_validation(void)
+{
+    lt_world_t* world_a;
+    lt_world_t* world_b;
+    lt_component_id_t position_a;
+    lt_component_id_t velocity_a;
+    lt_component_id_t position_b;
+    lt_component_id_t velocity_b;
+    lt_query_term_t term;
+    lt_query_desc_t desc;
+    lt_query_t* query_a;
+    lt_query_t* query_b;
+    lt_query_schedule_entry_t entry_a;
+    lt_query_schedule_entry_t mixed_entries[2];
+
+    ASSERT_STATUS(lt_world_create(NULL, &world_a), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_create(NULL, &world_b), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world_a, &position_a, &velocity_a) == 0);
+    ASSERT_TRUE(register_vec3_components(world_b, &position_b, &velocity_b) == 0);
+
+    memset(&term, 0, sizeof(term));
+    term.component_id = position_a;
+    term.access = LT_ACCESS_WRITE;
+    memset(&desc, 0, sizeof(desc));
+    desc.with_terms = &term;
+    desc.with_count = 1u;
+    ASSERT_STATUS(lt_query_create(world_a, &desc, &query_a), LT_STATUS_OK);
+
+    term.component_id = position_b;
+    term.access = LT_ACCESS_WRITE;
+    memset(&desc, 0, sizeof(desc));
+    desc.with_terms = &term;
+    desc.with_count = 1u;
+    ASSERT_STATUS(lt_query_create(world_b, &desc, &query_b), LT_STATUS_OK);
+
+    entry_a.query = query_a;
+    entry_a.callback = test_parallel_integrate_chunk;
+    entry_a.user_data = NULL;
+
+    ASSERT_STATUS(lt_query_schedule_execute(NULL, 0u, 1u, NULL), LT_STATUS_OK);
+    ASSERT_STATUS(lt_query_schedule_execute(NULL, 1u, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_query_schedule_execute(&entry_a, 1u, 0u, NULL), LT_STATUS_INVALID_ARGUMENT);
+
+    entry_a.callback = NULL;
+    ASSERT_STATUS(lt_query_schedule_execute(&entry_a, 1u, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
+    entry_a.callback = test_parallel_integrate_chunk;
+
+    mixed_entries[0].query = query_a;
+    mixed_entries[0].callback = test_parallel_integrate_chunk;
+    mixed_entries[0].user_data = NULL;
+    mixed_entries[1].query = query_b;
+    mixed_entries[1].callback = test_parallel_integrate_chunk;
+    mixed_entries[1].user_data = NULL;
+    ASSERT_STATUS(lt_query_schedule_execute(mixed_entries, 2u, 1u, NULL), LT_STATUS_INVALID_ARGUMENT);
+
+    ASSERT_STATUS(lt_world_begin_defer(world_a), LT_STATUS_OK);
+    ASSERT_STATUS(lt_query_schedule_execute(&mixed_entries[0], 1u, 2u, NULL), LT_STATUS_CONFLICT);
+    ASSERT_STATUS(lt_world_end_defer(world_a), LT_STATUS_OK);
+    ASSERT_STATUS(lt_world_flush(world_a), LT_STATUS_OK);
+
+    lt_query_destroy(query_b);
+    lt_query_destroy(query_a);
+    lt_world_destroy(world_b);
+    lt_world_destroy(world_a);
+    return 0;
+}
+
+static int test_query_schedule_batches_and_deterministic(void)
+{
+    test_determinism_snapshot_t serial_run;
+    test_determinism_snapshot_t parallel_run_a;
+    test_determinism_snapshot_t parallel_run_b;
+    lt_query_schedule_stats_t serial_stats;
+    lt_query_schedule_stats_t parallel_stats;
+
+    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 1u, &serial_run, &serial_stats) == 0);
+    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 4u, &parallel_run_a, &parallel_stats) == 0);
+    ASSERT_TRUE(run_schedule_simulation(0x00A11CEAu, 4u, &parallel_run_b, NULL) == 0);
+
+    ASSERT_TRUE(parallel_stats.batch_count == 2u);
+    ASSERT_TRUE(parallel_stats.edge_count == 1u);
+    ASSERT_TRUE(parallel_stats.max_batch_size == 2u);
+    ASSERT_TRUE(serial_stats.batch_count == parallel_stats.batch_count);
+    ASSERT_TRUE(serial_stats.edge_count == parallel_stats.edge_count);
+    ASSERT_TRUE(serial_stats.max_batch_size == parallel_stats.max_batch_size);
+
+    ASSERT_TRUE(serial_run.checksum == parallel_run_a.checksum);
+    ASSERT_TRUE(parallel_run_a.checksum == parallel_run_b.checksum);
+    ASSERT_TRUE(serial_run.stats.live_entities == parallel_run_a.stats.live_entities);
+    ASSERT_TRUE(serial_run.stats.chunk_count == parallel_run_a.stats.chunk_count);
+    ASSERT_TRUE(serial_run.stats.structural_moves == parallel_run_a.stats.structural_moves);
+    ASSERT_TRUE(parallel_run_a.stats.structural_moves == parallel_run_b.stats.structural_moves);
+    return 0;
+}
+
 static int test_determinism_seeded_mixed_sequence(void)
 {
     test_determinism_snapshot_t run_a;
@@ -1521,6 +1885,8 @@ int main(void)
     RUN_TEST(test_trace_hook_reports_query_events);
     RUN_TEST(test_parallel_query_for_each_chunk_validation);
     RUN_TEST(test_parallel_query_for_each_chunk_deterministic);
+    RUN_TEST(test_query_schedule_validation);
+    RUN_TEST(test_query_schedule_batches_and_deterministic);
     RUN_TEST(test_determinism_seeded_mixed_sequence);
     return 0;
 }

@@ -121,6 +121,18 @@ typedef void (*lt_query_parallel_chunk_fn)(
     uint32_t worker_index,
     void* user_data);
 
+typedef struct lt_query_schedule_entry_s {
+    lt_query_t* query;
+    lt_query_parallel_chunk_fn callback;
+    void* user_data;
+} lt_query_schedule_entry_t;
+
+typedef struct lt_query_schedule_stats_s {
+    uint32_t batch_count;
+    uint32_t edge_count;
+    uint32_t max_batch_size;
+} lt_query_schedule_stats_t;
+
 typedef struct lt_query_iter_s {
     lt_query_t* query;
     uint32_t archetype_index;
@@ -187,6 +199,11 @@ lt_status_t lt_query_for_each_chunk_parallel(
     uint32_t worker_count,
     lt_query_parallel_chunk_fn callback,
     void* user_data);
+lt_status_t lt_query_schedule_execute(
+    const lt_query_schedule_entry_t* entries,
+    uint32_t entry_count,
+    uint32_t worker_count,
+    lt_query_schedule_stats_t* out_stats);
 
 #ifdef __cplusplus
 }

@@ -133,6 +133,11 @@ typedef struct lt_parallel_worker_ctx_s {
     lt_status_t status;
 } lt_parallel_worker_ctx_t;
 
+typedef struct lt_schedule_stage_worker_ctx_s {
+    const lt_query_schedule_entry_t* entry;
+    lt_status_t status;
+} lt_schedule_stage_worker_ctx_t;
+
 void lt_query_destroy(lt_query_t* query);
 
 static int lt_is_power_of_two_u32(uint32_t v)
@@ -3081,6 +3086,363 @@ lt_status_t lt_query_for_each_chunk_parallel(
     }
     free(contexts);
     free(work_items);
+    return status;
+}
+
+static int lt_query_entries_conflict(const lt_query_t* a, const lt_query_t* b)
+{
+    uint32_t i;
+    uint32_t j;
+
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    for (i = 0u; i < a->with_count; ++i) {
+        lt_component_id_t component_id;
+        lt_access_t access_a;
+
+        component_id = a->with_terms[i].component_id;
+        access_a = a->with_terms[i].access;
+        for (j = 0u; j < b->with_count; ++j) {
+            lt_access_t access_b;
+
+            if (component_id != b->with_terms[j].component_id) {
+                continue;
+            }
+
+            access_b = b->with_terms[j].access;
+            if (access_a == LT_ACCESS_WRITE || access_b == LT_ACCESS_WRITE) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+static void* lt_query_schedule_stage_worker_entry(void* user_data)
+{
+    lt_schedule_stage_worker_ctx_t* ctx;
+
+    ctx = (lt_schedule_stage_worker_ctx_t*)user_data;
+    if (ctx == NULL || ctx->entry == NULL || ctx->entry->query == NULL || ctx->entry->callback == NULL) {
+        return NULL;
+    }
+
+    ctx->status = lt_query_for_each_chunk_parallel(
+        ctx->entry->query,
+        1u,
+        ctx->entry->callback,
+        ctx->entry->user_data);
+    return NULL;
+}
+#endif
+
+static lt_status_t lt_query_schedule_execute_stage(
+    const lt_query_schedule_entry_t* entries,
+    const uint32_t* stage_nodes,
+    uint32_t stage_count,
+    uint32_t worker_count)
+{
+    lt_status_t status;
+    uint32_t i;
+
+    if (entries == NULL || stage_nodes == NULL || worker_count == 0u) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (stage_count == 0u) {
+        return LT_STATUS_OK;
+    }
+
+    if (stage_count == 1u || worker_count == 1u) {
+        for (i = 0u; i < stage_count; ++i) {
+            const lt_query_schedule_entry_t* entry;
+
+            entry = &entries[stage_nodes[i]];
+            status = lt_query_for_each_chunk_parallel(
+                entry->query,
+                worker_count,
+                entry->callback,
+                entry->user_data);
+            if (status != LT_STATUS_OK) {
+                return status;
+            }
+        }
+        return LT_STATUS_OK;
+    }
+
+#if defined(LT_HAS_PTHREADS) && LT_HAS_PTHREADS
+    {
+        lt_schedule_stage_worker_ctx_t* contexts;
+        pthread_t* threads;
+        uint32_t parallel_queries;
+        uint32_t stage_offset;
+
+        parallel_queries = worker_count;
+        if (parallel_queries > stage_count) {
+            parallel_queries = stage_count;
+        }
+
+        if (sizeof(*contexts) > SIZE_MAX / (size_t)parallel_queries) {
+            return LT_STATUS_CAPACITY_REACHED;
+        }
+        contexts = (lt_schedule_stage_worker_ctx_t*)malloc(
+            sizeof(*contexts) * (size_t)parallel_queries);
+        if (contexts == NULL) {
+            return LT_STATUS_ALLOCATION_FAILED;
+        }
+        memset(contexts, 0, sizeof(*contexts) * (size_t)parallel_queries);
+
+        threads = NULL;
+        if (parallel_queries > 1u) {
+            if (sizeof(*threads) > SIZE_MAX / (size_t)(parallel_queries - 1u)) {
+                free(contexts);
+                return LT_STATUS_CAPACITY_REACHED;
+            }
+            threads = (pthread_t*)malloc(sizeof(*threads) * (size_t)(parallel_queries - 1u));
+            if (threads == NULL) {
+                free(contexts);
+                return LT_STATUS_ALLOCATION_FAILED;
+            }
+        }
+
+        status = LT_STATUS_OK;
+        for (stage_offset = 0u; stage_offset < stage_count; stage_offset += parallel_queries) {
+            uint32_t wave_count;
+            uint32_t launched_threads;
+
+            wave_count = stage_count - stage_offset;
+            if (wave_count > parallel_queries) {
+                wave_count = parallel_queries;
+            }
+
+            for (i = 0u; i < wave_count; ++i) {
+                const lt_query_schedule_entry_t* entry;
+
+                entry = &entries[stage_nodes[stage_offset + i]];
+                contexts[i].entry = entry;
+                contexts[i].status = LT_STATUS_OK;
+            }
+
+            launched_threads = 0u;
+            for (i = 1u; i < wave_count; ++i) {
+                int rc;
+
+                rc = pthread_create(
+                    &threads[i - 1u],
+                    NULL,
+                    lt_query_schedule_stage_worker_entry,
+                    &contexts[i]);
+                if (rc != 0) {
+                    status = LT_STATUS_ALLOCATION_FAILED;
+                    break;
+                }
+                launched_threads += 1u;
+            }
+
+            if (status == LT_STATUS_OK) {
+                contexts[0].status = lt_query_for_each_chunk_parallel(
+                    contexts[0].entry->query,
+                    1u,
+                    contexts[0].entry->callback,
+                    contexts[0].entry->user_data);
+            }
+
+            for (i = 0u; i < launched_threads; ++i) {
+                (void)pthread_join(threads[i], NULL);
+            }
+
+            if (status == LT_STATUS_OK) {
+                for (i = 0u; i < wave_count; ++i) {
+                    if (contexts[i].status != LT_STATUS_OK) {
+                        status = contexts[i].status;
+                        break;
+                    }
+                }
+            }
+
+            if (status != LT_STATUS_OK) {
+                break;
+            }
+        }
+
+        free(threads);
+        free(contexts);
+        return status;
+    }
+#else
+    for (i = 0u; i < stage_count; ++i) {
+        const lt_query_schedule_entry_t* entry;
+
+        entry = &entries[stage_nodes[i]];
+        status = lt_query_for_each_chunk_parallel(
+            entry->query,
+            worker_count,
+            entry->callback,
+            entry->user_data);
+        if (status != LT_STATUS_OK) {
+            return status;
+        }
+    }
+    return LT_STATUS_OK;
+#endif
+}
+
+lt_status_t lt_query_schedule_execute(
+    const lt_query_schedule_entry_t* entries,
+    uint32_t entry_count,
+    uint32_t worker_count,
+    lt_query_schedule_stats_t* out_stats)
+{
+    lt_world_t* world;
+    uint8_t* active;
+    uint8_t* edges;
+    uint32_t* indegree;
+    uint32_t* stage_nodes;
+    uint32_t i;
+    uint32_t remaining_count;
+    uint32_t batch_count;
+    uint32_t edge_count;
+    uint32_t max_batch_size;
+    size_t edge_matrix_count;
+    lt_status_t status;
+
+    if (out_stats != NULL) {
+        memset(out_stats, 0, sizeof(*out_stats));
+    }
+
+    if (entry_count == 0u) {
+        return LT_STATUS_OK;
+    }
+
+    if (entries == NULL || worker_count == 0u) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (entries[0].query == NULL || entries[0].query->world == NULL || entries[0].callback == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    world = entries[0].query->world;
+
+    if (worker_count > 1u && world->defer_depth > 0u) {
+        return LT_STATUS_CONFLICT;
+    }
+
+    for (i = 0u; i < entry_count; ++i) {
+        if (entries[i].query == NULL || entries[i].query->world != world || entries[i].callback == NULL) {
+            return LT_STATUS_INVALID_ARGUMENT;
+        }
+    }
+
+    edge_matrix_count = (size_t)entry_count;
+    if (edge_matrix_count > SIZE_MAX / (size_t)entry_count) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+    edge_matrix_count *= (size_t)entry_count;
+
+    if (sizeof(*active) > SIZE_MAX / (size_t)entry_count
+        || sizeof(*indegree) > SIZE_MAX / (size_t)entry_count
+        || sizeof(*stage_nodes) > SIZE_MAX / (size_t)entry_count
+        || sizeof(*edges) > SIZE_MAX / edge_matrix_count) {
+        return LT_STATUS_CAPACITY_REACHED;
+    }
+
+    active = (uint8_t*)malloc(sizeof(*active) * (size_t)entry_count);
+    indegree = (uint32_t*)malloc(sizeof(*indegree) * (size_t)entry_count);
+    stage_nodes = (uint32_t*)malloc(sizeof(*stage_nodes) * (size_t)entry_count);
+    edges = (uint8_t*)malloc(sizeof(*edges) * edge_matrix_count);
+    if (active == NULL || indegree == NULL || stage_nodes == NULL || edges == NULL) {
+        free(edges);
+        free(stage_nodes);
+        free(indegree);
+        free(active);
+        return LT_STATUS_ALLOCATION_FAILED;
+    }
+
+    memset(active, 1, sizeof(*active) * (size_t)entry_count);
+    memset(indegree, 0, sizeof(*indegree) * (size_t)entry_count);
+    memset(edges, 0, sizeof(*edges) * edge_matrix_count);
+
+    edge_count = 0u;
+    for (i = 0u; i < entry_count; ++i) {
+        uint32_t j;
+
+        for (j = i + 1u; j < entry_count; ++j) {
+            if (lt_query_entries_conflict(entries[i].query, entries[j].query)) {
+                edges[(size_t)i * (size_t)entry_count + (size_t)j] = 1u;
+                indegree[j] += 1u;
+                edge_count += 1u;
+            }
+        }
+    }
+
+    remaining_count = entry_count;
+    batch_count = 0u;
+    max_batch_size = 0u;
+    status = LT_STATUS_OK;
+
+    while (remaining_count > 0u) {
+        uint32_t stage_count;
+
+        stage_count = 0u;
+        for (i = 0u; i < entry_count; ++i) {
+            if (active[i] != 0u && indegree[i] == 0u) {
+                stage_nodes[stage_count] = i;
+                stage_count += 1u;
+            }
+        }
+
+        if (stage_count == 0u) {
+            status = LT_STATUS_CONFLICT;
+            break;
+        }
+
+        if (stage_count > max_batch_size) {
+            max_batch_size = stage_count;
+        }
+        batch_count += 1u;
+
+        status = lt_query_schedule_execute_stage(entries, stage_nodes, stage_count, worker_count);
+        if (status != LT_STATUS_OK) {
+            break;
+        }
+
+        for (i = 0u; i < stage_count; ++i) {
+            uint32_t node_index;
+            uint32_t j;
+
+            node_index = stage_nodes[i];
+            active[node_index] = 0u;
+            remaining_count -= 1u;
+
+            for (j = 0u; j < entry_count; ++j) {
+                size_t edge_index;
+
+                edge_index = (size_t)node_index * (size_t)entry_count + (size_t)j;
+                if (edges[edge_index] == 0u) {
+                    continue;
+                }
+                if (indegree[j] > 0u) {
+                    indegree[j] -= 1u;
+                }
+                edges[edge_index] = 0u;
+            }
+        }
+    }
+
+    if (out_stats != NULL) {
+        out_stats->batch_count = batch_count;
+        out_stats->edge_count = edge_count;
+        out_stats->max_batch_size = max_batch_size;
+    }
+
+    free(edges);
+    free(stage_nodes);
+    free(indegree);
+    free(active);
     return status;
 }
 
