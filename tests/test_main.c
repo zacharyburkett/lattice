@@ -57,6 +57,19 @@ typedef struct test_trace_capture_s {
     lt_trace_event_kind_t last_kind;
 } test_trace_capture_t;
 
+typedef struct test_entity_state_s {
+    lt_entity_t entity;
+    uint8_t alive;
+    uint8_t has_position;
+    uint8_t has_velocity;
+} test_entity_state_t;
+
+typedef struct test_determinism_snapshot_s {
+    uint64_t checksum;
+    lt_world_stats_t stats;
+    uint32_t tracked_alive_count;
+} test_determinism_snapshot_t;
+
 static void* test_alloc_only(void* user, size_t size, size_t align)
 {
     (void)user;
@@ -133,6 +146,60 @@ static void test_trace_hook(const lt_trace_event_t* event, void* user_data)
     }
 }
 
+static uint32_t test_rand_u32(uint32_t* state)
+{
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+static float test_rand_range(uint32_t* state, float min_value, float max_value)
+{
+    float t;
+    uint32_t r;
+
+    r = test_rand_u32(state);
+    t = (float)(r >> 8) / (float)0x00FFFFFFu;
+    return min_value + ((max_value - min_value) * t);
+}
+
+static uint64_t test_checksum_mix(uint64_t hash, uint64_t value)
+{
+    return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
+}
+
+static uint32_t test_float_bits(float value)
+{
+    uint32_t bits;
+
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static int test_pick_alive_index(
+    const test_entity_state_t* states,
+    uint32_t state_count,
+    uint32_t start,
+    uint32_t* out_index)
+{
+    uint32_t i;
+
+    if (states == NULL || out_index == NULL || state_count == 0u) {
+        return 0;
+    }
+
+    for (i = 0u; i < state_count; ++i) {
+        uint32_t idx;
+
+        idx = (start + i) % state_count;
+        if (states[idx].alive != 0u) {
+            *out_index = idx;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static int register_vec3_components(
     lt_world_t* world,
     lt_component_id_t* out_position,
@@ -148,6 +215,265 @@ static int register_vec3_components(
 
     desc.name = "Velocity";
     ASSERT_STATUS(lt_register_component(world, &desc, out_velocity), LT_STATUS_OK);
+    return 0;
+}
+
+static int run_seeded_determinism_sequence(
+    uint32_t seed,
+    test_determinism_snapshot_t* out_snapshot)
+{
+    enum {
+        INITIAL_ENTITY_COUNT = 24u,
+        FRAME_COUNT = 32u,
+        MAX_TRACKED_ENTITIES = 256u
+    };
+    lt_world_t* world;
+    lt_component_id_t position_id;
+    lt_component_id_t velocity_id;
+    lt_query_term_t terms[2];
+    lt_query_desc_t query_desc;
+    lt_query_t* query;
+    test_entity_state_t states[MAX_TRACKED_ENTITIES];
+    lt_world_stats_t stats;
+    uint32_t rng;
+    uint64_t checksum;
+    uint32_t state_count;
+    uint32_t frame;
+    uint32_t i;
+
+    ASSERT_TRUE(out_snapshot != NULL);
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    memset(states, 0, sizeof(states));
+    rng = seed;
+    checksum = 0xcbf29ce484222325ull;
+    state_count = 0u;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+    ASSERT_TRUE(register_vec3_components(world, &position_id, &velocity_id) == 0);
+
+    memset(terms, 0, sizeof(terms));
+    terms[0].component_id = position_id;
+    terms[0].access = LT_ACCESS_WRITE;
+    terms[1].component_id = velocity_id;
+    terms[1].access = LT_ACCESS_READ;
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.with_terms = terms;
+    query_desc.with_count = 2u;
+
+    ASSERT_STATUS(lt_query_create(world, &query_desc, &query), LT_STATUS_OK);
+
+    for (i = 0u; i < INITIAL_ENTITY_COUNT; ++i) {
+        lt_entity_t entity;
+        test_vec3_t position;
+        test_vec3_t velocity;
+
+        ASSERT_TRUE(state_count < MAX_TRACKED_ENTITIES);
+        ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+
+        states[state_count].entity = entity;
+        states[state_count].alive = 1u;
+        states[state_count].has_position = 0u;
+        states[state_count].has_velocity = 0u;
+
+        position.x = test_rand_range(&rng, -100.0f, 100.0f);
+        position.y = test_rand_range(&rng, -100.0f, 100.0f);
+        position.z = test_rand_range(&rng, -100.0f, 100.0f);
+        ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+        states[state_count].has_position = 1u;
+
+        if ((test_rand_u32(&rng) & 1u) != 0u) {
+            velocity.x = test_rand_range(&rng, -5.0f, 5.0f);
+            velocity.y = test_rand_range(&rng, -5.0f, 5.0f);
+            velocity.z = test_rand_range(&rng, -5.0f, 5.0f);
+            ASSERT_STATUS(lt_add_component(world, entity, velocity_id, &velocity), LT_STATUS_OK);
+            states[state_count].has_velocity = 1u;
+        }
+
+        state_count += 1u;
+    }
+
+    for (frame = 0u; frame < FRAME_COUNT; ++frame) {
+        lt_query_iter_t iter;
+        lt_chunk_view_t view;
+        uint8_t has_value;
+        uint32_t spawn_count;
+        uint32_t op_count;
+
+        ASSERT_STATUS(lt_query_iter_begin(query, &iter), LT_STATUS_OK);
+        while (1) {
+            ASSERT_STATUS(lt_query_iter_next(&iter, &view, &has_value), LT_STATUS_OK);
+            if (has_value == 0u) {
+                break;
+            }
+
+            for (i = 0u; i < view.count; ++i) {
+                test_vec3_t* position_col;
+                test_vec3_t* velocity_col;
+
+                position_col = (test_vec3_t*)view.columns[0];
+                velocity_col = (test_vec3_t*)view.columns[1];
+                position_col[i].x += velocity_col[i].x * (1.0f / 60.0f);
+                position_col[i].y += velocity_col[i].y * (1.0f / 90.0f);
+                position_col[i].z -= velocity_col[i].z * (1.0f / 120.0f);
+
+                checksum = test_checksum_mix(checksum, (uint64_t)(uint32_t)view.entities[i]);
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].x));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].y));
+                checksum = test_checksum_mix(checksum, (uint64_t)test_float_bits(position_col[i].z));
+            }
+        }
+
+        spawn_count = test_rand_u32(&rng) % 3u;
+        for (i = 0u; i < spawn_count; ++i) {
+            lt_entity_t entity;
+            test_vec3_t position;
+            test_vec3_t velocity;
+
+            if (state_count >= MAX_TRACKED_ENTITIES) {
+                break;
+            }
+
+            ASSERT_STATUS(lt_entity_create(world, &entity), LT_STATUS_OK);
+            states[state_count].entity = entity;
+            states[state_count].alive = 1u;
+            states[state_count].has_position = 0u;
+            states[state_count].has_velocity = 0u;
+
+            position.x = test_rand_range(&rng, -100.0f, 100.0f);
+            position.y = test_rand_range(&rng, -100.0f, 100.0f);
+            position.z = test_rand_range(&rng, -100.0f, 100.0f);
+            ASSERT_STATUS(lt_add_component(world, entity, position_id, &position), LT_STATUS_OK);
+            states[state_count].has_position = 1u;
+
+            if ((test_rand_u32(&rng) % 3u) != 0u) {
+                velocity.x = test_rand_range(&rng, -5.0f, 5.0f);
+                velocity.y = test_rand_range(&rng, -5.0f, 5.0f);
+                velocity.z = test_rand_range(&rng, -5.0f, 5.0f);
+                ASSERT_STATUS(lt_add_component(world, entity, velocity_id, &velocity), LT_STATUS_OK);
+                states[state_count].has_velocity = 1u;
+            }
+
+            state_count += 1u;
+        }
+
+        ASSERT_STATUS(lt_world_begin_defer(world), LT_STATUS_OK);
+        op_count = 1u + (test_rand_u32(&rng) % 5u);
+        for (i = 0u; i < op_count; ++i) {
+            uint32_t idx;
+            uint32_t op_kind;
+
+            if (!test_pick_alive_index(states, state_count, test_rand_u32(&rng), &idx)) {
+                break;
+            }
+
+            op_kind = test_rand_u32(&rng) % 4u;
+            if (op_kind == 0u) {
+                if (states[idx].has_velocity != 0u) {
+                    ASSERT_STATUS(
+                        lt_remove_component(world, states[idx].entity, velocity_id),
+                        LT_STATUS_OK);
+                    states[idx].has_velocity = 0u;
+                } else {
+                    test_vec3_t velocity;
+
+                    velocity.x = test_rand_range(&rng, -5.0f, 5.0f);
+                    velocity.y = test_rand_range(&rng, -5.0f, 5.0f);
+                    velocity.z = test_rand_range(&rng, -5.0f, 5.0f);
+                    ASSERT_STATUS(
+                        lt_add_component(world, states[idx].entity, velocity_id, &velocity),
+                        LT_STATUS_OK);
+                    states[idx].has_velocity = 1u;
+                }
+            } else if (op_kind == 1u) {
+                if (states[idx].has_position != 0u) {
+                    ASSERT_STATUS(
+                        lt_remove_component(world, states[idx].entity, position_id),
+                        LT_STATUS_OK);
+                    states[idx].has_position = 0u;
+                } else {
+                    test_vec3_t position;
+
+                    position.x = test_rand_range(&rng, -100.0f, 100.0f);
+                    position.y = test_rand_range(&rng, -100.0f, 100.0f);
+                    position.z = test_rand_range(&rng, -100.0f, 100.0f);
+                    ASSERT_STATUS(
+                        lt_add_component(world, states[idx].entity, position_id, &position),
+                        LT_STATUS_OK);
+                    states[idx].has_position = 1u;
+                }
+            } else if (op_kind == 2u) {
+                if (states[idx].has_position != 0u && states[idx].has_velocity != 0u) {
+                    ASSERT_STATUS(
+                        lt_remove_component(world, states[idx].entity, velocity_id),
+                        LT_STATUS_OK);
+                    states[idx].has_velocity = 0u;
+                } else if (states[idx].has_position != 0u) {
+                    test_vec3_t velocity;
+
+                    velocity.x = test_rand_range(&rng, -5.0f, 5.0f);
+                    velocity.y = test_rand_range(&rng, -5.0f, 5.0f);
+                    velocity.z = test_rand_range(&rng, -5.0f, 5.0f);
+                    ASSERT_STATUS(
+                        lt_add_component(world, states[idx].entity, velocity_id, &velocity),
+                        LT_STATUS_OK);
+                    states[idx].has_velocity = 1u;
+                }
+            } else {
+                ASSERT_STATUS(lt_entity_destroy(world, states[idx].entity), LT_STATUS_OK);
+                states[idx].alive = 0u;
+                states[idx].has_position = 0u;
+                states[idx].has_velocity = 0u;
+            }
+        }
+
+        ASSERT_STATUS(lt_world_end_defer(world), LT_STATUS_OK);
+        ASSERT_STATUS(lt_world_flush(world), LT_STATUS_OK);
+
+        ASSERT_STATUS(lt_world_get_stats(world, &stats), LT_STATUS_OK);
+        checksum = test_checksum_mix(checksum, stats.live_entities);
+        checksum = test_checksum_mix(checksum, stats.chunk_count);
+        checksum = test_checksum_mix(checksum, stats.structural_moves);
+
+        {
+            uint32_t tracked_alive_count;
+
+            tracked_alive_count = 0u;
+            for (i = 0u; i < state_count; ++i) {
+                uint8_t alive;
+
+                ASSERT_STATUS(lt_entity_is_alive(world, states[i].entity, &alive), LT_STATUS_OK);
+                ASSERT_TRUE(alive == states[i].alive);
+                if (states[i].alive == 0u) {
+                    continue;
+                }
+
+                {
+                    uint8_t has_position;
+                    uint8_t has_velocity;
+
+                    ASSERT_STATUS(
+                        lt_has_component(world, states[i].entity, position_id, &has_position),
+                        LT_STATUS_OK);
+                    ASSERT_STATUS(
+                        lt_has_component(world, states[i].entity, velocity_id, &has_velocity),
+                        LT_STATUS_OK);
+                    ASSERT_TRUE(has_position == states[i].has_position);
+                    ASSERT_TRUE(has_velocity == states[i].has_velocity);
+                }
+
+                tracked_alive_count += 1u;
+            }
+
+            ASSERT_TRUE(stats.live_entities == tracked_alive_count);
+            out_snapshot->tracked_alive_count = tracked_alive_count;
+        }
+    }
+
+    ASSERT_STATUS(lt_world_get_stats(world, &out_snapshot->stats), LT_STATUS_OK);
+    out_snapshot->checksum = checksum;
+    lt_query_destroy(query);
+    lt_world_destroy(world);
     return 0;
 }
 
@@ -943,6 +1269,31 @@ static int test_trace_hook_reports_query_events(void)
     return 0;
 }
 
+static int test_determinism_seeded_mixed_sequence(void)
+{
+    test_determinism_snapshot_t run_a;
+    test_determinism_snapshot_t run_b;
+    test_determinism_snapshot_t run_c;
+
+    ASSERT_TRUE(run_seeded_determinism_sequence(0x00C0FFEEu, &run_a) == 0);
+    ASSERT_TRUE(run_seeded_determinism_sequence(0x00C0FFEEu, &run_b) == 0);
+
+    ASSERT_TRUE(run_a.checksum == run_b.checksum);
+    ASSERT_TRUE(run_a.tracked_alive_count == run_b.tracked_alive_count);
+    ASSERT_TRUE(run_a.stats.live_entities == run_b.stats.live_entities);
+    ASSERT_TRUE(run_a.stats.archetype_count == run_b.stats.archetype_count);
+    ASSERT_TRUE(run_a.stats.chunk_count == run_b.stats.chunk_count);
+    ASSERT_TRUE(run_a.stats.pending_commands == run_b.stats.pending_commands);
+    ASSERT_TRUE(run_a.stats.defer_depth == run_b.stats.defer_depth);
+    ASSERT_TRUE(run_a.stats.structural_moves == run_b.stats.structural_moves);
+
+    ASSERT_TRUE(run_seeded_determinism_sequence(0x00C0FFEFu, &run_c) == 0);
+    ASSERT_TRUE(
+        run_c.checksum != run_a.checksum || run_c.stats.structural_moves != run_a.stats.structural_moves
+        || run_c.stats.live_entities != run_a.stats.live_entities);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_destroy_defaults);
@@ -963,5 +1314,6 @@ int main(void)
     RUN_TEST(test_deferred_command_ordering);
     RUN_TEST(test_trace_hook_reports_core_events);
     RUN_TEST(test_trace_hook_reports_query_events);
+    RUN_TEST(test_determinism_seeded_mixed_sequence);
     return 0;
 }
