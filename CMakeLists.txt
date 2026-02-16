@@ -78,5 +78,14 @@ if(LATTICE_BUILD_BENCHMARKS)
                 -DMODE=json
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
         )
+        add_test(
+            NAME lattice_bench_smoke_custom_workers
+            COMMAND ${CMAKE_COMMAND}
+                -DBENCH_EXE=$<TARGET_FILE:lattice_bench>
+                -DMODE=text
+                -DWORKERS=1,3,6
+                -DEXPECTED_WORKERS=1,3,6
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bench_output.cmake
+        )
     endif()
 endif()

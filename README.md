@@ -39,8 +39,9 @@ Status: early implementation. Phase 5 diagnostics and benchmark tooling are now 
   including query iteration begin/chunk/end events.
 - World stats snapshot API.
 - Benchmark app (`lattice_bench`) for throughput and structural-layout snapshots,
-  with `--format text|csv|json` output modes, worker sweep (`1/2/4/8`) speedup
-  reporting, and scheduler batch/edge metrics.
+  with `--format text|csv|json` output modes, configurable worker sweeps via
+  `--workers N[,N...]` (default `1,2,4,8`), speedup reporting, and scheduler
+  batch/edge metrics.
 - Unit tests for lifecycle, registration, structural moves, query filtering,
   deferred command semantics, and trace hook coverage.
 

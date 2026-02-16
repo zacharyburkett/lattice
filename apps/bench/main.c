@@ -22,12 +22,19 @@ typedef enum bench_output_format_e {
     BENCH_OUTPUT_JSON = 2
 } bench_output_format_t;
 
+enum {
+    BENCH_SWEEP_WORKER_COUNT_DEFAULT = 4,
+    BENCH_SWEEP_WORKER_COUNT_MAX = 16
+};
+
 typedef struct bench_options_s {
     uint32_t entity_count;
     uint32_t frame_count;
     uint32_t seed;
     uint8_t use_defer;
     bench_output_format_t output_format;
+    uint32_t worker_count;
+    uint32_t workers[BENCH_SWEEP_WORKER_COUNT_MAX];
 } bench_options_t;
 
 typedef struct bench_scheduler_case_s {
@@ -42,8 +49,6 @@ typedef struct bench_scheduler_case_s {
     lt_query_schedule_stats_t schedule_stats;
 } bench_scheduler_case_t;
 
-enum { BENCH_SWEEP_WORKER_COUNT = 4 };
-
 typedef struct bench_results_s {
     double spawn_ms;
     double simulate_ms;
@@ -51,7 +56,7 @@ typedef struct bench_results_s {
     uint64_t touched_entities;
     double checksum;
     uint32_t scheduler_case_count;
-    bench_scheduler_case_t scheduler_cases[BENCH_SWEEP_WORKER_COUNT];
+    bench_scheduler_case_t scheduler_cases[BENCH_SWEEP_WORKER_COUNT_MAX];
 } bench_results_t;
 
 typedef struct bench_motion_ctx_s {
@@ -81,7 +86,8 @@ static void bench_print_usage(const char* program)
 {
     fprintf(
         stderr,
-        "Usage: %s [--entities N] [--frames N] [--seed N] [--defer 0|1] [--format text|csv|json]\n",
+        "Usage: %s [--entities N] [--frames N] [--seed N] [--defer 0|1] "
+        "[--format text|csv|json] [--workers N[,N...]]\n",
         program);
 }
 
@@ -125,6 +131,56 @@ static int bench_parse_output_format(const char* arg, bench_output_format_t* out
     return 1;
 }
 
+static int bench_parse_workers(const char* arg, uint32_t* out_workers, uint32_t* out_count)
+{
+    const char* cursor;
+    uint32_t count;
+
+    if (arg == NULL || out_workers == NULL || out_count == NULL || arg[0] == '\0') {
+        return 1;
+    }
+
+    cursor = arg;
+    count = 0u;
+    while (*cursor != '\0') {
+        char* end_ptr;
+        unsigned long parsed;
+        uint32_t parsed_worker;
+        uint32_t j;
+
+        parsed = strtoul(cursor, &end_ptr, 10);
+        if (end_ptr == cursor || parsed == 0ul || parsed > 0xFFFFFFFFul) {
+            return 1;
+        }
+        if (count >= BENCH_SWEEP_WORKER_COUNT_MAX) {
+            return 1;
+        }
+
+        parsed_worker = (uint32_t)parsed;
+        for (j = 0u; j < count; ++j) {
+            if (out_workers[j] == parsed_worker) {
+                return 1;
+            }
+        }
+        out_workers[count] = parsed_worker;
+        count += 1u;
+
+        if (*end_ptr == '\0') {
+            break;
+        }
+        if (*end_ptr != ',') {
+            return 1;
+        }
+        cursor = end_ptr + 1;
+        if (*cursor == '\0') {
+            return 1;
+        }
+    }
+
+    *out_count = count;
+    return count == 0u ? 1 : 0;
+}
+
 static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
 {
     int i;
@@ -139,6 +195,11 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
     out_opts->seed = 1337u;
     out_opts->use_defer = 1u;
     out_opts->output_format = BENCH_OUTPUT_TEXT;
+    out_opts->worker_count = BENCH_SWEEP_WORKER_COUNT_DEFAULT;
+    out_opts->workers[0] = 1u;
+    out_opts->workers[1] = 2u;
+    out_opts->workers[2] = 4u;
+    out_opts->workers[3] = 8u;
 
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--entities") == 0) {
@@ -166,6 +227,16 @@ static int bench_parse_options(int argc, char** argv, bench_options_t* out_opts)
         } else if (strcmp(argv[i], "--format") == 0) {
             if (i + 1 >= argc
                 || bench_parse_output_format(argv[i + 1], &out_opts->output_format) != 0) {
+                return 1;
+            }
+            i += 1;
+        } else if (strcmp(argv[i], "--workers") == 0) {
+            if (i + 1 >= argc
+                || bench_parse_workers(
+                    argv[i + 1],
+                    out_opts->workers,
+                    &out_opts->worker_count)
+                    != 0) {
                 return 1;
             }
             i += 1;
@@ -716,7 +787,6 @@ static void bench_print_results(
 
 int main(int argc, char** argv)
 {
-    const uint32_t worker_sweep[BENCH_SWEEP_WORKER_COUNT] = { 1u, 2u, 4u, 8u };
     bench_options_t opts;
     bench_results_t results;
     lt_world_stats_t baseline_stats;
@@ -729,10 +799,10 @@ int main(int argc, char** argv)
     }
 
     memset(&results, 0, sizeof(results));
-    results.scheduler_case_count = BENCH_SWEEP_WORKER_COUNT;
+    results.scheduler_case_count = opts.worker_count;
 
-    for (i = 0u; i < BENCH_SWEEP_WORKER_COUNT; ++i) {
-        if (bench_run_scheduler_case(&opts, worker_sweep[i], &results.scheduler_cases[i]) != 0) {
+    for (i = 0u; i < opts.worker_count; ++i) {
+        if (bench_run_scheduler_case(&opts, opts.workers[i], &results.scheduler_cases[i]) != 0) {
             return 1;
         }
     }
