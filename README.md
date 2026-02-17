@@ -1,64 +1,71 @@
 # Lattice
 
-Lattice is a high-performance Entity-Component-System (ECS) framework in C for
-the Ardent engine ecosystem.
+Lattice is a data-oriented ECS framework in C with archetype/chunk storage.
 
-Status: baseline feature set is in place; release hardening and API/docs freeze are in progress.
+> Stability notice
+> This repository is pre-1.0 and not stable. APIs, scheduling behavior, and internal data layout details may change between commits.
 
-## Design Intent
+## What Is Implemented
 
-- Fast iteration over component data (cache-friendly, data-oriented).
-- Deterministic world updates for game/simulation loops.
-- Small, explicit C API with allocator-aware configuration.
-- Ergonomic enough for gameplay code without hiding cost.
+Core library target:
 
-## Proposed Shape
+- `lattice::lattice`
 
-- Archetype-chunk storage as the default data model.
-- Stable entity handles (`index + generation`) for safety.
-- Deferred structural changes (`add/remove component`, destroy) during system
-  execution.
-- Query API that returns contiguous batches for tight loops.
+Current feature set:
 
-## What Exists Today
+- World lifecycle and stats APIs
+- Stable entity handles (index + generation)
+- Component registration and metadata validation
+- Archetype/chunk storage with structural moves
+- Direct component add/remove/get/has APIs
+- Query API with chunk iteration
+- Deferred structural command buffer
+- Experimental parallel query iteration helper
+- Experimental conflict-aware query scheduler and compiled schedules
+- Benchmark executable with text/csv/json output modes
 
-- World lifecycle API (`lt_world_create`, `lt_world_destroy`).
-- Entity allocation/destruction with stale-handle protection.
-- Component registration with metadata validation and duplicate-name rejection.
-- Archetype/chunk storage and structural entity moves for component add/remove.
-- Direct component access APIs (`lt_add_component`, `lt_remove_component`,
-  `lt_has_component`, `lt_get_component`).
-- Query API for archetype-matched chunk iteration (`lt_query_*`).
-- Experimental chunk-level parallel query execution helper
-  (`lt_query_for_each_chunk_parallel`).
-- Experimental conflict-aware query scheduler with topological batches,
-  including compiled schedules for steady-state loops
-  (`lt_schedule_create`, `lt_schedule_execute`, `lt_query_schedule_execute`).
-- Deferred structural command buffer (`lt_world_begin_defer`,
-  `lt_world_end_defer`, `lt_world_flush`).
-- Trace hook diagnostics for runtime event capture (`lt_world_set_trace_hook`),
-  including query iteration begin/chunk/end events.
-- World stats snapshot API.
-- Benchmark app (`lattice_bench`) for throughput and structural-layout snapshots,
-  with `--format text|csv|json` output modes, scene selection via
-  `--scene steady|churn`, configurable worker sweeps via `--workers N[,N...]`
-  (default `1,2,4,8`), churn tuning via `--churn-rate` and
-  `--churn-initial-ratio`, speedup reporting, and scheduler batch/edge plus
-  structural-operation metrics.
-- Unit tests for lifecycle, registration, structural moves, query filtering,
-  deferred command semantics, and trace hook coverage.
-
-## Quick Start
+## Build
 
 ```sh
 cmake -S . -B build
 cmake --build build
+```
+
+Run tests:
+
+```sh
 ctest --test-dir build --output-on-failure
 ```
 
-## Docs Map
+Run benchmark app (when enabled):
 
-- Proposal and option analysis: `docs/PROPOSAL.md`
-- System design details: `docs/ARCHITECTURE.md`
-- Draft C API surface: `docs/API_SKETCH.md`
-- Delivery phases and acceptance criteria: `docs/PROJECT_PLAN.md`
+```sh
+./build/lattice_bench
+```
+
+## CMake Options
+
+- `LATTICE_BUILD_TESTS=ON|OFF`
+- `LATTICE_BUILD_BENCHMARKS=ON|OFF`
+
+## Consumer Integration
+
+From source:
+
+```cmake
+add_subdirectory(/absolute/path/to/lattice ${CMAKE_BINARY_DIR}/_deps/lattice EXCLUDE_FROM_ALL)
+target_link_libraries(my_target PRIVATE lattice::lattice)
+```
+
+Installed package export is also generated (`latticeTargets.cmake`).
+
+Public umbrella include:
+
+- `include/lattice/lattice.h`
+
+## Docs
+
+- `docs/PROPOSAL.md`
+- `docs/ARCHITECTURE.md`
+- `docs/API_SKETCH.md`
+- `docs/PROJECT_PLAN.md`
