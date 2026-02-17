@@ -184,6 +184,36 @@ lt_status_t lt_register_component(
     lt_world_t* world,
     const lt_component_desc_t* desc,
     lt_component_id_t* out_id);
+lt_status_t lt_find_component(
+    const lt_world_t* world,
+    const char* name,
+    lt_component_id_t* out_id);
+lt_status_t lt_component_get_name(
+    const lt_world_t* world,
+    lt_component_id_t component_id,
+    const char** out_name);
+lt_status_t lt_component_get_layout(
+    const lt_world_t* world,
+    lt_component_id_t component_id,
+    uint32_t* out_size,
+    uint32_t* out_align,
+    uint32_t* out_flags);
+lt_status_t lt_world_copy_component_ids(
+    const lt_world_t* world,
+    lt_component_id_t* out_component_ids,
+    uint32_t max_component_ids,
+    uint32_t* out_count);
+lt_status_t lt_world_copy_entities(
+    const lt_world_t* world,
+    lt_entity_t* out_entities,
+    uint32_t max_entities,
+    uint32_t* out_count);
+lt_status_t lt_world_copy_entity_components(
+    const lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t* out_component_ids,
+    uint32_t max_component_ids,
+    uint32_t* out_count);
 
 lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_stats);
 

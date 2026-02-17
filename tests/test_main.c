@@ -980,6 +980,7 @@ static int test_component_registration(void)
     lt_component_desc_t desc;
     lt_component_id_t c0;
     lt_component_id_t c1;
+    lt_component_id_t found;
 
     ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
 
@@ -990,12 +991,18 @@ static int test_component_registration(void)
 
     ASSERT_STATUS(lt_register_component(world, &desc, &c0), LT_STATUS_OK);
     ASSERT_TRUE(c0 != LT_COMPONENT_INVALID);
+    ASSERT_STATUS(lt_find_component(world, "Transform", &found), LT_STATUS_OK);
+    ASSERT_TRUE(found == c0);
 
     ASSERT_STATUS(lt_register_component(world, &desc, &c1), LT_STATUS_ALREADY_EXISTS);
 
     desc.name = "Velocity";
     ASSERT_STATUS(lt_register_component(world, &desc, &c1), LT_STATUS_OK);
     ASSERT_TRUE(c1 == c0 + 1u);
+    ASSERT_STATUS(lt_find_component(world, "Velocity", &found), LT_STATUS_OK);
+    ASSERT_TRUE(found == c1);
+    ASSERT_STATUS(lt_find_component(world, "Missing", &found), LT_STATUS_NOT_FOUND);
+    ASSERT_STATUS(lt_find_component(world, NULL, &found), LT_STATUS_INVALID_ARGUMENT);
 
     lt_world_destroy(world);
     return 0;
@@ -1028,6 +1035,102 @@ static int test_component_validation(void)
     desc.size = 4u;
     desc.align = 1u;
     ASSERT_STATUS(lt_register_component(world, &desc, &id), LT_STATUS_INVALID_ARGUMENT);
+
+    lt_world_destroy(world);
+    return 0;
+}
+
+static int test_world_introspection_snapshots(void)
+{
+    lt_world_t* world;
+    lt_component_desc_t desc;
+    lt_component_id_t position_id;
+    lt_component_id_t tag_id;
+    lt_entity_t e0;
+    lt_entity_t e1;
+    test_vec3_t position;
+    const char* name;
+    uint32_t size;
+    uint32_t align;
+    uint32_t flags;
+    lt_component_id_t component_ids[8];
+    uint32_t component_count;
+    lt_entity_t entities[8];
+    uint32_t entity_count;
+    lt_component_id_t entity_components[8];
+    uint32_t entity_component_count;
+
+    ASSERT_STATUS(lt_world_create(NULL, &world), LT_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "Position";
+    desc.size = (uint32_t)sizeof(test_vec3_t);
+    desc.align = (uint32_t)_Alignof(test_vec3_t);
+    ASSERT_STATUS(lt_register_component(world, &desc, &position_id), LT_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "SelectedTag";
+    desc.flags = LT_COMPONENT_FLAG_TAG;
+    desc.size = 0u;
+    desc.align = 1u;
+    ASSERT_STATUS(lt_register_component(world, &desc, &tag_id), LT_STATUS_OK);
+
+    ASSERT_STATUS(lt_entity_create(world, &e0), LT_STATUS_OK);
+    ASSERT_STATUS(lt_entity_create(world, &e1), LT_STATUS_OK);
+    position.x = 1.0f;
+    position.y = 2.0f;
+    position.z = 3.0f;
+    ASSERT_STATUS(lt_add_component(world, e0, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, e1, position_id, &position), LT_STATUS_OK);
+    ASSERT_STATUS(lt_add_component(world, e1, tag_id, NULL), LT_STATUS_OK);
+
+    name = NULL;
+    ASSERT_STATUS(lt_component_get_name(world, position_id, &name), LT_STATUS_OK);
+    ASSERT_TRUE(name != NULL);
+    ASSERT_TRUE(strcmp(name, "Position") == 0);
+
+    size = 0u;
+    align = 0u;
+    flags = 0u;
+    ASSERT_STATUS(
+        lt_component_get_layout(world, position_id, &size, &align, &flags),
+        LT_STATUS_OK
+    );
+    ASSERT_TRUE(size == (uint32_t)sizeof(test_vec3_t));
+    ASSERT_TRUE(align == (uint32_t)_Alignof(test_vec3_t));
+    ASSERT_TRUE(flags == LT_COMPONENT_FLAG_NONE);
+
+    component_count = 0u;
+    ASSERT_STATUS(
+        lt_world_copy_component_ids(world, component_ids, 8u, &component_count),
+        LT_STATUS_OK
+    );
+    ASSERT_TRUE(component_count == 2u);
+    ASSERT_TRUE(component_ids[0] == position_id);
+    ASSERT_TRUE(component_ids[1] == tag_id);
+
+    entity_count = 0u;
+    ASSERT_STATUS(lt_world_copy_entities(world, entities, 8u, &entity_count), LT_STATUS_OK);
+    ASSERT_TRUE(entity_count == 2u);
+    ASSERT_TRUE(entities[0] == e0);
+    ASSERT_TRUE(entities[1] == e1);
+
+    entity_component_count = 0u;
+    ASSERT_STATUS(
+        lt_world_copy_entity_components(world, e1, entity_components, 8u, &entity_component_count),
+        LT_STATUS_OK
+    );
+    ASSERT_TRUE(entity_component_count == 2u);
+    ASSERT_TRUE(entity_components[0] == position_id);
+    ASSERT_TRUE(entity_components[1] == tag_id);
+
+    ASSERT_STATUS(lt_component_get_name(world, LT_COMPONENT_INVALID, &name), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_world_copy_component_ids(NULL, component_ids, 8u, &component_count), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(lt_world_copy_entities(NULL, entities, 8u, &entity_count), LT_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(
+        lt_world_copy_entity_components(world, LT_ENTITY_NULL, entity_components, 8u, &entity_component_count),
+        LT_STATUS_INVALID_ARGUMENT
+    );
 
     lt_world_destroy(world);
     return 0;
@@ -1915,6 +2018,7 @@ int main(void)
     RUN_TEST(test_entity_capacity_growth);
     RUN_TEST(test_component_registration);
     RUN_TEST(test_component_validation);
+    RUN_TEST(test_world_introspection_snapshots);
     RUN_TEST(test_add_remove_components_preserve_data);
     RUN_TEST(test_swap_remove_updates_entity_locations);
     RUN_TEST(test_world_stats_structural_moves);

@@ -2509,6 +2509,27 @@ lt_status_t lt_register_component(
     return LT_STATUS_OK;
 }
 
+lt_status_t lt_find_component(
+    const lt_world_t* world,
+    const char* name,
+    lt_component_id_t* out_id)
+{
+    uint32_t i;
+
+    if (world == NULL || name == NULL || name[0] == '\0' || out_id == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    for (i = 1u; i <= world->component_count; ++i) {
+        if (lt_component_names_equal(world->components[i].name, name)) {
+            *out_id = i;
+            return LT_STATUS_OK;
+        }
+    }
+
+    return LT_STATUS_NOT_FOUND;
+}
+
 lt_status_t lt_query_create(lt_world_t* world, const lt_query_desc_t* desc, lt_query_t** out_query)
 {
     lt_query_t* query;
@@ -3644,5 +3665,153 @@ lt_status_t lt_world_get_stats(const lt_world_t* world, lt_world_stats_t* out_st
     out_stats->pending_commands = world->deferred_count;
     out_stats->defer_depth = world->defer_depth;
     out_stats->structural_moves = world->structural_move_count;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_component_get_name(
+    const lt_world_t* world,
+    lt_component_id_t component_id,
+    const char** out_name)
+{
+    if (world == NULL || out_name == NULL || component_id == LT_COMPONENT_INVALID) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    if (component_id > world->component_count) {
+        return LT_STATUS_NOT_FOUND;
+    }
+    if (world->components[component_id].name == NULL) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    *out_name = world->components[component_id].name;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_component_get_layout(
+    const lt_world_t* world,
+    lt_component_id_t component_id,
+    uint32_t* out_size,
+    uint32_t* out_align,
+    uint32_t* out_flags)
+{
+    const lt_component_record_t* component;
+
+    if (
+        world == NULL ||
+        component_id == LT_COMPONENT_INVALID ||
+        out_size == NULL ||
+        out_align == NULL ||
+        out_flags == NULL
+    ) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    if (component_id > world->component_count) {
+        return LT_STATUS_NOT_FOUND;
+    }
+
+    component = &world->components[component_id];
+    *out_size = component->size;
+    *out_align = component->align;
+    *out_flags = component->flags;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_world_copy_component_ids(
+    const lt_world_t* world,
+    lt_component_id_t* out_component_ids,
+    uint32_t max_component_ids,
+    uint32_t* out_count)
+{
+    uint32_t copied;
+    uint32_t i;
+
+    if (world == NULL || out_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    if (max_component_ids > 0u && out_component_ids == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    copied = (world->component_count < max_component_ids) ? world->component_count : max_component_ids;
+    for (i = 0u; i < copied; ++i) {
+        out_component_ids[i] = i + 1u;
+    }
+
+    *out_count = copied;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_world_copy_entities(
+    const lt_world_t* world,
+    lt_entity_t* out_entities,
+    uint32_t max_entities,
+    uint32_t* out_count)
+{
+    uint32_t copied;
+    uint32_t i;
+
+    if (world == NULL || out_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    if (max_entities > 0u && out_entities == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    copied = 0u;
+    for (i = 0u; i < world->entity_count; ++i) {
+        const lt_entity_slot_t* slot;
+
+        slot = &world->entities[i];
+        if (slot->alive == 0u) {
+            continue;
+        }
+        if (copied < max_entities) {
+            out_entities[copied] = lt_entity_pack(i, slot->generation);
+            copied += 1u;
+        } else {
+            break;
+        }
+    }
+
+    *out_count = copied;
+    return LT_STATUS_OK;
+}
+
+lt_status_t lt_world_copy_entity_components(
+    const lt_world_t* world,
+    lt_entity_t entity,
+    lt_component_id_t* out_component_ids,
+    uint32_t max_component_ids,
+    uint32_t* out_count)
+{
+    lt_entity_slot_t* slot;
+    uint32_t copied;
+    uint32_t i;
+    lt_status_t status;
+
+    if (world == NULL || entity == LT_ENTITY_NULL || out_count == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+    if (max_component_ids > 0u && out_component_ids == NULL) {
+        return LT_STATUS_INVALID_ARGUMENT;
+    }
+
+    status = lt_world_get_live_slot(world, entity, &slot);
+    if (status != LT_STATUS_OK) {
+        return status;
+    }
+    if (slot->archetype == NULL) {
+        *out_count = 0u;
+        return LT_STATUS_OK;
+    }
+
+    copied = (slot->archetype->component_count < max_component_ids)
+        ? slot->archetype->component_count
+        : max_component_ids;
+    for (i = 0u; i < copied; ++i) {
+        out_component_ids[i] = slot->archetype->component_ids[i];
+    }
+
+    *out_count = copied;
     return LT_STATUS_OK;
 }
